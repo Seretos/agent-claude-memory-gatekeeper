@@ -1,0 +1,33 @@
+name: lint
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate plugin.json is valid JSON
+        run: jq empty .claude-plugin/plugin.json
+
+      - name: Validate SKILL.md has YAML frontmatter
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          text = open("skills/memory-gatekeeper/SKILL.md", encoding="utf-8").read()
+          m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+          if not m:
+              print("::error::SKILL.md missing YAML frontmatter"); sys.exit(1)
+          fm = m.group(1)
+          if "name:" not in fm or "description:" not in fm:
+              print("::error::SKILL.md frontmatter missing 'name' or 'description'"); sys.exit(1)
+          print("SKILL.md: OK")
+          EOF

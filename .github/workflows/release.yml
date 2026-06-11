@@ -1,0 +1,186 @@
+name: release
+
+# Manual release flow:
+#   1. Trigger via Actions tab -> "Run workflow" -> enter version (e.g. 0.0.1)
+#      or via CLI: gh workflow run release.yml -f version=0.0.1
+#   2. Workflow stamps version into plugin.json (in CI only), pushes an orphan
+#      release branch with install-ready files, creates the
+#      agent-claude-memory-gatekeeper--v{version} tag on that commit, and publishes a
+#      GitHub Release with the zip attached.
+#   3. The workflow then notifies agent-marketplace directly via
+#      MARKETPLACE_DISPATCH_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (semver, no leading v) e.g. 0.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate version is semver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if tag already exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
+            exit 1
+          fi
+
+      - name: Stamp version into plugin manifests (in CI only)
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          # Both plugin manifests (Claude + Codex) get the same version.
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            tmp=$(mktemp)
+            jq --arg v "$V" '.version = $v' "$manifest" > "$tmp"
+            mv "$tmp" "$manifest"
+          done
+          echo "Stamped version $V"
+
+      - name: Stage install tree and build release zip
+        id: stage
+        shell: bash
+        run: |
+          STAGE="build/stage/agent-claude-memory-gatekeeper"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/.claude-plugin" "$STAGE/.codex-plugin" "$STAGE/skills"
+          cp .claude-plugin/plugin.json "$STAGE/.claude-plugin/"
+          cp .codex-plugin/plugin.json  "$STAGE/.codex-plugin/"
+          cp -a skills/. "$STAGE/skills/"
+          cp README.md "$STAGE/"
+          cp LICENSE "$STAGE/" 2>/dev/null || true
+          # assets/ goes onto the orphan release branch so the dispatch
+          # payload's icon URL (raw.githubusercontent.com/${repo}/${TAG}/
+          # assets/icon.png) resolves.
+          [ -d assets ] && cp -a assets "$STAGE/" || true
+          # description.md ships onto the orphan release branch so the dispatch
+          # payload's description_url resolves at the tagged commit.
+          [ -f description.md ] && cp -a description.md "$STAGE/" || true
+
+          mkdir -p dist
+          ZIPNAME="agent-claude-memory-gatekeeper-${{ inputs.version }}.zip"
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/dist/$ZIPNAME" .)
+
+          echo "stage=$STAGE"      >> "$GITHUB_OUTPUT"
+          echo "zip=dist/$ZIPNAME" >> "$GITHUB_OUTPUT"
+
+      - name: Push orphan release branch and capture commit
+        id: rel
+        shell: bash
+        run: |
+          STAGE="${{ steps.stage.outputs.stage }}"
+          ZIP="${{ steps.stage.outputs.zip }}"
+          if [ ! -d "$STAGE" ]; then
+            echo "::error::staging dir $STAGE not produced"; exit 1
+          fi
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::release zip $ZIP not produced"
+            ls -la dist/ || true
+            exit 1
+          fi
+
+          # Stash staging tree AND the release zip outside the worktree, since
+          # "git checkout --orphan" + clean will wipe dist/ before we attach
+          # the zip to the GitHub Release.
+          TMP=$(mktemp -d)
+          cp -a "$STAGE"/. "$TMP/"
+          ASSET_DIR=$(mktemp -d)
+          cp "$ZIP" "$ASSET_DIR/"
+          echo "asset=$ASSET_DIR/$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan release
+          git rm -rf . > /dev/null 2>&1 || true
+          git clean -fdx > /dev/null 2>&1 || true
+
+          leftover=$(find . -mindepth 1 -maxdepth 1 -not -name '.git' || true)
+          if [ -n "$leftover" ]; then
+            echo "::error::working tree not empty after clean:"; echo "$leftover"; exit 1
+          fi
+
+          cp -a "$TMP"/. .
+
+          echo "=== release branch contents ==="
+          find . -mindepth 1 -not -path './.git*' | sort
+
+          git add -A
+          git commit -m "release: v${{ inputs.version }}"
+          git push origin release --force
+
+          SHA=$(git rev-parse HEAD)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ steps.rel.outputs.sha }}" \
+            --title "$TAG" \
+            --generate-notes \
+            ${{ contains(inputs.version, '-') && '--prerelease' || '' }} \
+            "${{ steps.rel.outputs.asset }}"
+
+      # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
+      # (Actions blocks this to prevent recursive loops). Call the marketplace
+      # directly with a separate PAT.
+      - name: Dispatch to agent-marketplace
+        shell: bash
+        env:
+          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          DESC=$(jq -r '.description' .claude-plugin/plugin.json)
+          NAME=$(jq -r '.name'        .claude-plugin/plugin.json)
+          TAG="${NAME}--v${VERSION}"
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            -d @- <<EOF
+          {
+            "event_type": "plugin-release",
+            "client_payload": {
+              "name":        "${NAME}",
+              "description": "${DESC}",
+              "repo":        "${{ github.repository }}",
+              "category":    "skill",
+              "version":     "${VERSION}",
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
+              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
+            }
+          }
+          EOF
