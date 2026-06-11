@@ -1,0 +1,17 @@
+{
+  "description": "Intercepts Write and Edit calls targeting Claude Code's memory store and redirects them into a configurable gatekeeper tree, so memories can be reviewed before being promoted.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/memory-gatekeeper-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
