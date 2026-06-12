@@ -1,0 +1,9 @@
+{
+  "name": "agent-claude-memory-gatekeeper",
+  "description": "Intercepts Claude's memory-save process and redirects new memories into a review folder, so you can approve them before they are persisted and shared.",
+  "version": "0.0.1",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "dependencies": []
+}
