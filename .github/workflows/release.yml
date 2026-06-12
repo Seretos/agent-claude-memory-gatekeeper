@@ -69,10 +69,11 @@ jobs:
         run: |
           STAGE="build/stage/agent-claude-memory-gatekeeper"
           rm -rf "$STAGE"
-          mkdir -p "$STAGE/.claude-plugin" "$STAGE/.codex-plugin" "$STAGE/skills"
+          mkdir -p "$STAGE/.claude-plugin" "$STAGE/.codex-plugin" "$STAGE/hooks" "$STAGE/scripts"
           cp .claude-plugin/plugin.json "$STAGE/.claude-plugin/"
           cp .codex-plugin/plugin.json  "$STAGE/.codex-plugin/"
-          cp -a skills/. "$STAGE/skills/"
+          cp -a hooks/. "$STAGE/hooks/"
+          cp -a scripts/. "$STAGE/scripts/"
           cp README.md "$STAGE/"
           cp LICENSE "$STAGE/" 2>/dev/null || true
           # assets/ goes onto the orphan release branch so the dispatch
@@ -176,7 +177,8 @@ jobs:
               "name":        "${NAME}",
               "description": "${DESC}",
               "repo":        "${{ github.repository }}",
-              "category":    "skill",
+              "category":    "hook",
+              "tags":        ["claude", "memory"],
               "version":     "${VERSION}",
               "ref":         "${TAG}",
               "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
