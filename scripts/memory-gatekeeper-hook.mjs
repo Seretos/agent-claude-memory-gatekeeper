@@ -107,6 +107,23 @@ function resolveGatekeeperPath(parsed, envDir) {
 }
 
 /**
+ * Check whether a resolved target path is inside the gatekeeper tree root.
+ *
+ * Uses normalised (forward-slash) prefix matching to avoid false positives
+ * from shared-prefix directory names.
+ *
+ * @param {string} resolvedTarget — absolute resolved target path
+ * @param {string} gatekeeperRoot — absolute gatekeeper root path
+ * @returns {boolean}
+ */
+function isInsideGatekeeperTree(resolvedTarget, gatekeeperRoot) {
+  const normTarget = normalisePath(resolvedTarget);
+  const normRoot = normalisePath(gatekeeperRoot);
+  // Must be equal to root or start with root + "/"
+  return normTarget === normRoot || normTarget.startsWith(normRoot + "/");
+}
+
+/**
  * Bootstrap a valid Obsidian vault at `gatekeeperRoot` if `.obsidian` is absent.
  *
  * Idempotent: if `.obsidian` already exists, returns immediately.
@@ -162,25 +179,130 @@ function bootstrapObsidian(
 }
 
 /**
+ * Derive the project name from the current working directory.
+ *
+ * @returns {string} — the last path segment of process.cwd()
+ */
+function deriveProjectName() {
+  return path.basename(process.cwd());
+}
+
+/**
+ * Stamp a `project: <name>` YAML frontmatter line into file content.
+ *
+ * Convention:
+ *   - If content begins with `---\n`, insert/update `project:` inside that block.
+ *   - Otherwise, prepend `---\nproject: <name>\n---\n`.
+ *
+ * @param {string} content     — existing file content
+ * @param {string} projectName — project name to stamp
+ * @returns {string}           — content with project: frontmatter
+ */
+function stampProjectFrontmatter(content, projectName) {
+  if (content.startsWith("---\n")) {
+    // Find the closing ---
+    const closingIdx = content.indexOf("\n---", 4);
+    if (closingIdx !== -1) {
+      // We have a frontmatter block.
+      const frontmatter = content.slice(0, closingIdx);
+      const rest = content.slice(closingIdx);
+      // Check if project: already exists inside the block.
+      const projectLineRe = /^project:.*$/m;
+      if (projectLineRe.test(frontmatter)) {
+        // Update existing project: line.
+        return frontmatter.replace(projectLineRe, `project: ${projectName}`) + rest;
+      } else {
+        // Insert project: line after the opening ---.
+        return "---\n" + `project: ${projectName}\n` + frontmatter.slice(4) + rest;
+      }
+    }
+    // No closing --- found — treat as no frontmatter block, prepend.
+    return `---\nproject: ${projectName}\n---\n` + content;
+  }
+  // No frontmatter — prepend block.
+  return `---\nproject: ${projectName}\n---\n` + content;
+}
+
+/**
+ * Apply a single Edit operation (old_string → new_string) to content.
+ *
+ * Replicates Claude Code Edit semantics:
+ *   - replaceAll === true: replace all occurrences.
+ *   - Otherwise: exactly one occurrence must exist; throws if 0 or >1.
+ *
+ * @param {string} content   — file content to edit
+ * @param {string} oldString — text to find
+ * @param {string} newString — text to replace with
+ * @param {boolean} [replaceAll] — replace all occurrences when true
+ * @returns {string} — updated content
+ * @throws {Error} — when occurrence count is not exactly 1 (and replaceAll is not true)
+ */
+function applyEdit(content, oldString, newString, replaceAll) {
+  if (replaceAll === true) {
+    return content.split(oldString).join(newString);
+  }
+  // Count occurrences.
+  let count = 0;
+  let idx = 0;
+  while (true) {
+    const found = content.indexOf(oldString, idx);
+    if (found === -1) break;
+    count++;
+    idx = found + oldString.length;
+  }
+  if (count === 0) {
+    throw new Error(
+      `old_string not found in content: ${JSON.stringify(oldString.slice(0, 80))}`
+    );
+  }
+  if (count > 1) {
+    throw new Error(
+      `old_string found ${count} times; use replace_all to replace all occurrences`
+    );
+  }
+  return content.slice(0, content.indexOf(oldString)) +
+    newString +
+    content.slice(content.indexOf(oldString) + oldString.length);
+}
+
+/**
  * Classify an Edit call to determine what action is needed.
  *
  * Returns one of:
- *   "seed-and-deny"   — gatekeeper copy absent, live file exists → seed from live.
- *   "deny-existing"   — gatekeeper copy already exists → no re-seed.
- *   "pass-through"    — neither gatekeeper copy nor live file exists → exit 0.
+ *   "seed-and-apply" — gatekeeper copy absent, live file exists → seed then apply.
+ *   "apply"          — gatekeeper copy exists and content equals live file content.
+ *   "divergent"      — gatekeeper copy exists and differs from live file.
+ *   "pass-through"   — neither gatekeeper copy nor live file exists → exit 0.
  *
  * @param {string} gatekeeperPath — resolved gatekeeper file path
  * @param {string} liveFilePath   — original target path (inside projects/…/memory/…)
- * @returns {"seed-and-deny"|"deny-existing"|"pass-through"}
+ * @returns {"seed-and-apply"|"apply"|"divergent"|"pass-through"}
  */
 function classifyEditCase(gatekeeperPath, liveFilePath) {
   const gatekeeperExists = fs.existsSync(gatekeeperPath);
-  if (gatekeeperExists) return "deny-existing";
 
-  const liveExists = fs.existsSync(liveFilePath);
-  if (liveExists) return "seed-and-deny";
+  if (!gatekeeperExists) {
+    const liveExists = fs.existsSync(liveFilePath);
+    if (liveExists) return "seed-and-apply";
+    return "pass-through";
+  }
 
-  return "pass-through";
+  // Gatekeeper copy exists — compare contents with live.
+  try {
+    const liveExists = fs.existsSync(liveFilePath);
+    if (!liveExists) {
+      // Gatekeeper exists but live does not — treat as divergent
+      // (gatekeeper has content that was never committed to live).
+      return "divergent";
+    }
+    const gkContent = fs.readFileSync(gatekeeperPath, "utf8");
+    const liveContent = fs.readFileSync(liveFilePath, "utf8");
+    if (gkContent === liveContent) return "apply";
+    return "divergent";
+  } catch {
+    // Fault-tolerant: if reads fail, treat as divergent (safe default).
+    return "divergent";
+  }
 }
 
 /**
@@ -194,6 +316,63 @@ function buildAdditionalContext(gatekeeperPath) {
   return (
     `Memory writes to this path are redirected. ` +
     `Write to the following path instead: ${gatekeeperPath}`
+  );
+}
+
+/**
+ * Build context for a successfully applied edit.
+ * Contains no forbidden words in prose.
+ *
+ * @param {string} gatekeeperPath — absolute path to the staged copy
+ * @returns {string}
+ */
+function buildAppliedContext(gatekeeperPath) {
+  return (
+    `Edit applied to the staged copy at ${gatekeeperPath}. ` +
+    `You do not need to edit this file further. ` +
+    `You do not manage MEMORY.md.`
+  );
+}
+
+/**
+ * Build context for the divergent case — staged copy has local changes.
+ * Contains no forbidden words in prose.
+ *
+ * @param {string} gatekeeperPath — absolute path to the staged copy
+ * @returns {string}
+ */
+function buildDivergentContext(gatekeeperPath) {
+  return (
+    `The staged copy at ${gatekeeperPath} has existing changes. ` +
+    `Read that file and edit it directly.`
+  );
+}
+
+/**
+ * Build context for a hard-deny on MEMORY.md writes.
+ * Contains no forbidden words in prose.
+ *
+ * @returns {string}
+ */
+function buildMemoryMdDenyContext() {
+  return (
+    `MEMORY.md is auto-generated and cannot be written directly. ` +
+    `Do not write this file.`
+  );
+}
+
+/**
+ * Build context for a rejected empty Write.
+ * Contains no forbidden words in prose.
+ *
+ * @param {string} gatekeeperPath — absolute path to the staged copy
+ * @returns {string}
+ */
+function buildEmptyWriteDenyContext(gatekeeperPath) {
+  return (
+    `Empty content is not accepted. ` +
+    `Write a non-empty file to ${gatekeeperPath} to stage changes. ` +
+    `An empty file at that path signals a deletion.`
   );
 }
 
@@ -339,6 +518,12 @@ function main() {
       process.exit(0);
     }
 
+    // Hard-deny MEMORY.md in Bash path.
+    if (parsed.rest === "MEMORY.md") {
+      emitDeny(buildMemoryMdDenyContext());
+      process.exit(0);
+    }
+
     const intent = classifyBashIntent(command);
     const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
     const gatekeeperDir = path.dirname(gatekeeperPath);
@@ -346,12 +531,21 @@ function main() {
 
     if (intent === "delete") {
       // Seed a zero-byte tombstone in the gatekeeper tree.
-      fs.mkdirSync(gatekeeperDir, { recursive: true });
-      fs.writeFileSync(gatekeeperPath, "");
-      const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
-      bootstrapObsidian(gatekeeperRoot, parsed.base);
+      // The deny is emitted unconditionally below — even when the tombstone
+      // write fails — so the destructive command is never allowed through.
+      try {
+        fs.mkdirSync(gatekeeperDir, { recursive: true });
+        fs.writeFileSync(gatekeeperPath, "");
+        const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+        bootstrapObsidian(gatekeeperRoot, parsed.base);
+      } catch (err) {
+        process.stderr.write(
+          `memory-gatekeeper-hook: tombstone write failed: ${err instanceof Error ? err.message : String(err)}\n`
+        );
+      }
     }
     // write-intent: hard deny, no gatekeeper file written.
+    // deny is ALWAYS emitted regardless of tombstone outcome.
 
     emitDeny(additionalContext);
     process.exit(0);
@@ -381,12 +575,39 @@ function main() {
   const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
   const gatekeeperDir = path.dirname(gatekeeperPath);
 
+  // -------------------------------------------------------------------------
+  // Gatekeeper-path pass-through guard (infinite-loop prevention).
+  // If the target path is already inside the gatekeeper tree, let it through.
+  // -------------------------------------------------------------------------
+  const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+  if (isInsideGatekeeperTree(path.resolve(targetPath), gatekeeperRoot)) {
+    process.exit(0);
+  }
+
+  // -------------------------------------------------------------------------
+  // Hard-deny MEMORY.md (non-Bash path)
+  // -------------------------------------------------------------------------
+  if (parsed.rest === "MEMORY.md") {
+    emitDeny(buildMemoryMdDenyContext());
+    process.exit(0);
+  }
+
   if (toolName === "Write") {
     const content = typeof toolInput.content === "string" ? toolInput.content : "";
+
+    // Reject empty content.
+    if (content === "") {
+      emitDeny(buildEmptyWriteDenyContext(gatekeeperPath));
+      process.exit(0);
+    }
+
+    // Stamp project: frontmatter.
+    const projectName = deriveProjectName();
+    const stampedContent = stampProjectFrontmatter(content, projectName);
+
     fs.mkdirSync(gatekeeperDir, { recursive: true });
-    fs.writeFileSync(gatekeeperPath, content);
+    fs.writeFileSync(gatekeeperPath, stampedContent);
     emitDeny(buildAdditionalContext(gatekeeperPath));
-    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
     bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
@@ -400,14 +621,123 @@ function main() {
       process.exit(0);
     }
 
-    if (editCase === "seed-and-deny") {
-      fs.mkdirSync(gatekeeperDir, { recursive: true });
-      fs.copyFileSync(liveFilePath, gatekeeperPath);
-    }
-    // "deny-existing": gatekeeper copy already there — no re-seed.
+    if (editCase === "seed-and-apply") {
+      // Seed from live (with project: stamp), then apply the edit.
+      try {
+        const liveContent = fs.readFileSync(liveFilePath, "utf8");
+        const projectName = deriveProjectName();
+        const seededContent = stampProjectFrontmatter(liveContent, projectName);
+        fs.mkdirSync(gatekeeperDir, { recursive: true });
+        fs.writeFileSync(gatekeeperPath, seededContent);
 
-    emitDeny(buildAdditionalContext(gatekeeperPath));
-    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+        // Apply the edit(s) to the newly-seeded copy.
+        if (toolName === "Edit") {
+          const oldString = typeof toolInput.old_string === "string" ? toolInput.old_string : "";
+          const newString = typeof toolInput.new_string === "string" ? toolInput.new_string : "";
+          const replaceAll = toolInput.replace_all === true;
+          try {
+            const currentContent = fs.readFileSync(gatekeeperPath, "utf8");
+            const updatedContent = applyEdit(currentContent, oldString, newString, replaceAll);
+            fs.writeFileSync(gatekeeperPath, updatedContent);
+          } catch {
+            // Edit apply failed — fall through with seeded content, emit divergent.
+            emitDeny(buildDivergentContext(gatekeeperPath));
+            bootstrapObsidian(gatekeeperRoot, parsed.base);
+            process.exit(0);
+          }
+        } else {
+          // MultiEdit — apply sequentially.
+          const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+          let currentContent = fs.readFileSync(gatekeeperPath, "utf8");
+          let applyFailed = false;
+          for (const edit of edits) {
+            try {
+              currentContent = applyEdit(
+                currentContent,
+                typeof edit.old_string === "string" ? edit.old_string : "",
+                typeof edit.new_string === "string" ? edit.new_string : "",
+                edit.replace_all === true
+              );
+            } catch {
+              applyFailed = true;
+              break;
+            }
+          }
+          if (applyFailed) {
+            emitDeny(buildDivergentContext(gatekeeperPath));
+            bootstrapObsidian(gatekeeperRoot, parsed.base);
+            process.exit(0);
+          }
+          fs.writeFileSync(gatekeeperPath, currentContent);
+        }
+
+        emitDeny(buildAppliedContext(gatekeeperPath));
+        bootstrapObsidian(gatekeeperRoot, parsed.base);
+        process.exit(0);
+      } catch {
+        // Any FS error during seed — emit divergent feedback.
+        emitDeny(buildDivergentContext(gatekeeperPath));
+        bootstrapObsidian(gatekeeperRoot, parsed.base);
+        process.exit(0);
+      }
+    }
+
+    if (editCase === "apply") {
+      // Gatekeeper copy == live: apply the edit(s) directly to review copy.
+      if (toolName === "Edit") {
+        const oldString = typeof toolInput.old_string === "string" ? toolInput.old_string : "";
+        const newString = typeof toolInput.new_string === "string" ? toolInput.new_string : "";
+        const replaceAll = toolInput.replace_all === true;
+        try {
+          const currentContent = fs.readFileSync(gatekeeperPath, "utf8");
+          const updatedContent = applyEdit(currentContent, oldString, newString, replaceAll);
+          fs.writeFileSync(gatekeeperPath, updatedContent);
+          emitDeny(buildAppliedContext(gatekeeperPath));
+        } catch {
+          emitDeny(buildDivergentContext(gatekeeperPath));
+        }
+      } else {
+        // MultiEdit.
+        const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+        let currentContent;
+        try {
+          currentContent = fs.readFileSync(gatekeeperPath, "utf8");
+        } catch {
+          emitDeny(buildDivergentContext(gatekeeperPath));
+          bootstrapObsidian(gatekeeperRoot, parsed.base);
+          process.exit(0);
+        }
+        let applyFailed = false;
+        for (const edit of edits) {
+          try {
+            currentContent = applyEdit(
+              currentContent,
+              typeof edit.old_string === "string" ? edit.old_string : "",
+              typeof edit.new_string === "string" ? edit.new_string : "",
+              edit.replace_all === true
+            );
+          } catch {
+            applyFailed = true;
+            break;
+          }
+        }
+        if (applyFailed) {
+          emitDeny(buildDivergentContext(gatekeeperPath));
+        } else {
+          try {
+            fs.writeFileSync(gatekeeperPath, currentContent);
+            emitDeny(buildAppliedContext(gatekeeperPath));
+          } catch {
+            emitDeny(buildDivergentContext(gatekeeperPath));
+          }
+        }
+      }
+      bootstrapObsidian(gatekeeperRoot, parsed.base);
+      process.exit(0);
+    }
+
+    // editCase === "divergent"
+    emitDeny(buildDivergentContext(gatekeeperPath));
     bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
@@ -420,13 +750,16 @@ function main() {
       process.exit(0);
     }
 
-    if (editCase === "seed-and-deny") {
+    if (editCase === "seed-and-apply") {
       fs.mkdirSync(gatekeeperDir, { recursive: true });
-      fs.copyFileSync(liveFilePath, gatekeeperPath);
+      try {
+        fs.copyFileSync(liveFilePath, gatekeeperPath);
+      } catch {
+        // Fault-tolerant.
+      }
     }
 
     emitDeny(buildAdditionalContext(gatekeeperPath));
-    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
     bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
@@ -450,6 +783,15 @@ export {
   parseBashCommand,
   classifyBashIntent,
   buildBashDenyContext,
+  // New exports for ticket #6
+  isInsideGatekeeperTree,
+  deriveProjectName,
+  stampProjectFrontmatter,
+  applyEdit,
+  buildAppliedContext,
+  buildDivergentContext,
+  buildMemoryMdDenyContext,
+  buildEmptyWriteDenyContext,
 };
 
 // Only run main() when executed directly (not imported as a module).
