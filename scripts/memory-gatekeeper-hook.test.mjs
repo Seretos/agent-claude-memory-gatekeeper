@@ -16,8 +16,10 @@ import { fileURLToPath } from "node:url";
 import {
   parseMemoryPath,
   resolveGatekeeperPath,
+  resolveGatekeeperRoot,
   classifyEditCase,
   buildAdditionalContext,
+  bootstrapObsidian,
 } from "./memory-gatekeeper-hook.mjs";
 
 const HOOK_SCRIPT = path.resolve(
@@ -137,6 +139,18 @@ function makeEditEvent(filePath) {
   };
 }
 
+/**
+ * Create a minimal fake template dir containing at least app.json.
+ * Returns the templateDir path.
+ */
+function makeFakeTemplate() {
+  const templateDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-tpl-"));
+  fs.writeFileSync(path.join(templateDir, "app.json"), JSON.stringify({ userIgnoreFilters: ["(?<!\\.md)$"] }));
+  const pluginDir = path.join(templateDir, "plugins", "memory-gatekeeper");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  return templateDir;
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — pure helpers
 // ---------------------------------------------------------------------------
@@ -231,6 +245,116 @@ test("buildAdditionalContext: does not contain forbidden words", () => {
   for (const word of forbidden) {
     assert(!ctx.includes(word), `additionalContext must not contain '${word}'`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests — resolveGatekeeperRoot
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests: resolveGatekeeperRoot ---");
+
+test("resolveGatekeeperRoot: undefined envDir → base/gatekeeper", () => {
+  const parsed = { base: "/home/user", slug: "my-slug", rest: "NOTE.md" };
+  const result = resolveGatekeeperRoot(parsed, undefined);
+  assertEqual(result, path.join("/home/user", "gatekeeper"), "default root");
+});
+
+test("resolveGatekeeperRoot: relative envDir → base/gatekeeper", () => {
+  const parsed = { base: "/home/user", slug: "my-slug", rest: "NOTE.md" };
+  const result = resolveGatekeeperRoot(parsed, "relative/path");
+  assertEqual(result, path.join("/home/user", "gatekeeper"), "relative falls back");
+});
+
+test("resolveGatekeeperRoot: empty string envDir → base/gatekeeper", () => {
+  const parsed = { base: "/home/user", slug: "my-slug", rest: "NOTE.md" };
+  const result = resolveGatekeeperRoot(parsed, "");
+  assertEqual(result, path.join("/home/user", "gatekeeper"), "empty falls back");
+});
+
+test("resolveGatekeeperRoot: absolute envDir → returns envDir", () => {
+  const parsed = { base: "/home/user", slug: "my-slug", rest: "NOTE.md" };
+  // Use an OS-valid absolute path.
+  const absDir = os.platform() === "win32" ? "C:\\custom\\gk" : "/custom/gk";
+  const result = resolveGatekeeperRoot(parsed, absDir);
+  assertEqual(result, absDir, "absolute env var returned as-is");
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests — bootstrapObsidian
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests: bootstrapObsidian ---");
+
+test("bootstrapObsidian: happy path creates .obsidian/app.json and data.json with targetFolder", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-boot-"));
+  const gatekeeperRoot = path.join(tmpDir, "gatekeeper");
+  const base = path.join(tmpDir, "base");
+  const templateDir = makeFakeTemplate();
+
+  bootstrapObsidian(gatekeeperRoot, base, templateDir);
+
+  const obsidianDir = path.join(gatekeeperRoot, ".obsidian");
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json created");
+
+  const dataJsonPath = path.join(obsidianDir, "plugins", "memory-gatekeeper", "data.json");
+  assert(fs.existsSync(dataJsonPath), "data.json created");
+  const data = JSON.parse(fs.readFileSync(dataJsonPath, "utf8"));
+  assertEqual(data.targetFolder, path.join(base, "projects"), "targetFolder is base/projects");
+
+  fs.rmSync(tmpDir, { recursive: true });
+  fs.rmSync(templateDir, { recursive: true });
+});
+
+test("bootstrapObsidian: idempotent — sentinel file survives second call", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-boot-"));
+  const gatekeeperRoot = path.join(tmpDir, "gatekeeper");
+  const base = path.join(tmpDir, "base");
+  const templateDir = makeFakeTemplate();
+
+  bootstrapObsidian(gatekeeperRoot, base, templateDir);
+
+  // Write a sentinel file into .obsidian after first bootstrap.
+  const sentinel = path.join(gatekeeperRoot, ".obsidian", "sentinel.txt");
+  fs.writeFileSync(sentinel, "do-not-overwrite");
+
+  // Second call should be a no-op (obsidianDir already exists).
+  bootstrapObsidian(gatekeeperRoot, base, templateDir);
+
+  assert(fs.existsSync(sentinel), "sentinel file still present after second call");
+  assertEqual(fs.readFileSync(sentinel, "utf8"), "do-not-overwrite", "sentinel content unchanged");
+
+  fs.rmSync(tmpDir, { recursive: true });
+  fs.rmSync(templateDir, { recursive: true });
+});
+
+test("bootstrapObsidian: missing template → no throw, no .obsidian created", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-boot-"));
+  const gatekeeperRoot = path.join(tmpDir, "gatekeeper");
+  const base = path.join(tmpDir, "base");
+  const missingTemplate = path.join(tmpDir, "does-not-exist");
+
+  // Must not throw.
+  bootstrapObsidian(gatekeeperRoot, base, missingTemplate);
+
+  const obsidianDir = path.join(gatekeeperRoot, ".obsidian");
+  assert(!fs.existsSync(obsidianDir), ".obsidian NOT created when template absent");
+
+  fs.rmSync(tmpDir, { recursive: true });
+});
+
+test("bootstrapObsidian: error path (gatekeeperRoot is a file) → no throw", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-boot-"));
+  // Make gatekeeperRoot a FILE, not a directory, so fs.cpSync will fail.
+  const gatekeeperRoot = path.join(tmpDir, "is-a-file");
+  fs.writeFileSync(gatekeeperRoot, "i am a file");
+  const base = path.join(tmpDir, "base");
+  const templateDir = makeFakeTemplate();
+
+  // Must not throw.
+  bootstrapObsidian(gatekeeperRoot, base, templateDir);
+
+  fs.rmSync(tmpDir, { recursive: true });
+  fs.rmSync(templateDir, { recursive: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -446,6 +570,131 @@ test("Empty stdin → exit 0, no write, no output", () => {
   const result = runHookRaw("");
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stdout.trim(), "", "no output");
+});
+
+// ---------------------------------------------------------------------------
+// E2E tests — Obsidian bootstrap
+// ---------------------------------------------------------------------------
+
+console.log("\n--- E2E tests: Obsidian bootstrap ---");
+
+test("E2E Write in-scope → .obsidian bootstrapped at base/gatekeeper", () => {
+  const { base, slug, liveFile } = makeTempBase("boot-slug1", "NOTE.md");
+
+  const result = runHook(makeWriteEvent(liveFile, "boot test"));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stderr.trim(), "", "no stderr errors");
+
+  const gatekeeperRoot = path.join(base, "gatekeeper");
+  const obsidianDir = path.join(gatekeeperRoot, ".obsidian");
+  // The static template is in the repo — app.json should be present.
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json created");
+
+  const dataJsonPath = path.join(obsidianDir, "plugins", "memory-gatekeeper", "data.json");
+  assert(fs.existsSync(dataJsonPath), "data.json created");
+  const data = JSON.parse(fs.readFileSync(dataJsonPath, "utf8"));
+  assertEqual(data.targetFolder, path.join(base, "projects"), "targetFolder correct");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("E2E Write with absolute CLAUDE_MEMORY_GATEKEEPER_DIR → .obsidian bootstrapped at that root", () => {
+  const { base, liveFile } = makeTempBase("boot-slug2", "NOTE.md");
+  const customGk = fs.mkdtempSync(path.join(os.tmpdir(), "boot-custom-gk-"));
+
+  const result = runHook(
+    makeWriteEvent(liveFile, "boot custom"),
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk }
+  );
+  assertEqual(result.status, 0, "exit 0");
+
+  const obsidianDir = path.join(customGk, ".obsidian");
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json at custom root");
+
+  const dataJsonPath = path.join(obsidianDir, "plugins", "memory-gatekeeper", "data.json");
+  assert(fs.existsSync(dataJsonPath), "data.json at custom root");
+  const data = JSON.parse(fs.readFileSync(dataJsonPath, "utf8"));
+  assertEqual(data.targetFolder, path.join(base, "projects"), "targetFolder uses parsed.base");
+
+  fs.rmSync(base, { recursive: true });
+  fs.rmSync(customGk, { recursive: true });
+});
+
+test("E2E Edit seed-and-deny → .obsidian bootstrapped", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("boot-edit1", "LIVE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const result = runHook(makeEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+
+  const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json created on Edit seed-and-deny");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("E2E Edit deny-existing → .obsidian bootstrapped (idempotent on second call)", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("boot-edit2", "GK.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "GK.md");
+  fs.mkdirSync(path.dirname(gkPath), { recursive: true });
+  fs.writeFileSync(gkPath, "gatekeeper content");
+
+  // First Edit: deny-existing, bootstrap fires.
+  runHook(makeEditEvent(liveFile));
+
+  const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json after first deny-existing");
+
+  // Write a sentinel to verify idempotency.
+  const sentinel = path.join(obsidianDir, "sentinel.txt");
+  fs.writeFileSync(sentinel, "keep-me");
+
+  // Second Edit: deny-existing, bootstrap is idempotent.
+  runHook(makeEditEvent(liveFile));
+  assert(fs.existsSync(sentinel), "sentinel survives second Edit call");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("E2E Edit pass-through → .obsidian NOT created", () => {
+  const { base, liveFile } = makeTempBase("boot-edit3", "GHOST.md");
+  // Neither gatekeeper copy nor live file — pass-through.
+
+  const result = runHook(makeEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output");
+
+  const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
+  assert(!fs.existsSync(obsidianDir), ".obsidian NOT created on pass-through");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("E2E second Write to same root → no re-bootstrap (.obsidian unchanged)", () => {
+  const { base, slug, liveFile } = makeTempBase("boot-slug3", "NOTE.md");
+
+  // First Write: bootstrap fires.
+  runHook(makeWriteEvent(liveFile, "first write"));
+
+  const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
+  assert(fs.existsSync(path.join(obsidianDir, "app.json")), "app.json after first write");
+
+  // Write a sentinel.
+  const sentinel = path.join(obsidianDir, "sentinel.txt");
+  fs.writeFileSync(sentinel, "keep-me");
+
+  // Second Write: bootstrap is a no-op.
+  const liveFile2 = path.join(base, "projects", slug, "memory", "NOTE2.md");
+  runHook(makeWriteEvent(liveFile2, "second write"));
+
+  assert(fs.existsSync(sentinel), "sentinel survives second Write");
+  assertEqual(fs.readFileSync(sentinel, "utf8"), "keep-me", "sentinel content unchanged");
+
+  fs.rmSync(base, { recursive: true });
 });
 
 // ---------------------------------------------------------------------------

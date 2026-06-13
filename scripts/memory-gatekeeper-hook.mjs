@@ -12,6 +12,10 @@
  *   2. <base>/gatekeeper/<slug>/memory/<rest>
  *      — where <base> is everything before the `projects/` segment.
  *
+ * On the first memory write that is redirected, the hook bootstraps a valid
+ * Obsidian vault at the gatekeeper root if `.obsidian` is absent there.
+ * Bootstrap is fault-tolerant: any error is written to stderr and ignored.
+ *
  * Human review of the gatekeeper copies is an out-of-band manual step.
  * This hook never promotes or approves anything automatically.
  */
@@ -67,6 +71,19 @@ function parseMemoryPath(filePath) {
 }
 
 /**
+ * Resolve the gatekeeper root directory from a parsed memory path and the
+ * optional env var.
+ *
+ * @param {object} parsed   — result of parseMemoryPath: { base, slug, rest }
+ * @param {string} [envDir] — value of CLAUDE_MEMORY_GATEKEEPER_DIR (may be undefined)
+ * @returns {string}        — absolute path to the gatekeeper root
+ */
+function resolveGatekeeperRoot(parsed, envDir) {
+  if (envDir && path.isAbsolute(envDir)) return envDir;
+  return path.join(parsed.base, "gatekeeper");
+}
+
+/**
  * Resolve the absolute gatekeeper path for a given parsed memory path.
  *
  * @param {object} parsed   — result of parseMemoryPath: { base, slug, rest }
@@ -74,16 +91,64 @@ function parseMemoryPath(filePath) {
  * @returns {string}        — absolute path inside the gatekeeper tree
  */
 function resolveGatekeeperPath(parsed, envDir) {
-  const { base, slug, rest } = parsed;
-
-  let gatekeeperRoot;
-  if (envDir && path.isAbsolute(envDir)) {
-    gatekeeperRoot = envDir;
-  } else {
-    gatekeeperRoot = path.join(base, "gatekeeper");
-  }
-
+  const { slug, rest } = parsed;
+  const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
   return path.join(gatekeeperRoot, slug, "memory", ...rest.split("/"));
+}
+
+/**
+ * Bootstrap a valid Obsidian vault at `gatekeeperRoot` if `.obsidian` is absent.
+ *
+ * Idempotent: if `.obsidian` already exists, returns immediately.
+ * Fault-tolerant: any error is written to stderr and the function returns
+ * without throwing — the hook must never crash Claude Code.
+ *
+ * @param {string} gatekeeperRoot — the gatekeeper root directory
+ * @param {string} base           — the Claude projects base (used for data.json targetFolder)
+ * @param {string} [templateDir]  — path to the `.obsidian` template dir (injected by tests)
+ */
+function bootstrapObsidian(
+  gatekeeperRoot,
+  base,
+  templateDir = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../obsidian-template/.obsidian"
+  )
+) {
+  try {
+    const obsidianDir = path.join(gatekeeperRoot, ".obsidian");
+
+    // Idempotent: already bootstrapped.
+    if (fs.existsSync(obsidianDir)) return;
+
+    // Template missing → graceful no-op (e.g. local dev without plugin build).
+    if (!fs.existsSync(templateDir)) return;
+
+    // Copy the static template tree.
+    fs.cpSync(templateDir, obsidianDir, { recursive: true });
+
+    // Generate the machine-specific data.json for the memory-gatekeeper plugin.
+    const pluginDir = path.join(obsidianDir, "plugins", "memory-gatekeeper");
+    fs.mkdirSync(pluginDir, { recursive: true });
+
+    const dataJson = {
+      targetFolder: path.join(base, "projects"),
+      includeExtensions: ["md"],
+      pollIntervalMs: 4000,
+      graphHighlightColor: 16733525,
+      dismissed: {},
+    };
+    fs.writeFileSync(
+      path.join(pluginDir, "data.json"),
+      JSON.stringify(dataJson, null, 2) + "\n"
+    );
+  } catch (err) {
+    process.stderr.write(
+      `memory-gatekeeper-hook: bootstrapObsidian error: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`
+    );
+  }
 }
 
 /**
@@ -177,6 +242,8 @@ function main() {
     fs.mkdirSync(gatekeeperDir, { recursive: true });
     fs.writeFileSync(gatekeeperPath, content);
     emitDeny(gatekeeperPath);
+    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+    bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
 
@@ -196,6 +263,8 @@ function main() {
     // "deny-existing": gatekeeper copy already there — no re-seed.
 
     emitDeny(gatekeeperPath);
+    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+    bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
 
@@ -207,8 +276,10 @@ function main() {
 export {
   parseMemoryPath,
   resolveGatekeeperPath,
+  resolveGatekeeperRoot,
   classifyEditCase,
   buildAdditionalContext,
+  bootstrapObsidian,
 };
 
 // Only run main() when executed directly (not imported as a module).

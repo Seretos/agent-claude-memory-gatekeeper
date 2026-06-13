@@ -63,6 +63,31 @@ jobs:
           done
           echo "Stamped version $V"
 
+      - name: Download obsidian-memory-gatekeeper v0.0.2 plugin build
+        shell: bash
+        run: |
+          PLUGIN_DIR="obsidian-template/.obsidian/plugins/memory-gatekeeper"
+          mkdir -p "$PLUGIN_DIR"
+          ZIP_URL="https://github.com/Seretos/obsidian-memory-gatekeeper/releases/download/v0.0.2/obsidian-memory-gatekeeper-0.0.2.zip"
+          curl -fsSL -o /tmp/obsidian-memory-gatekeeper.zip "$ZIP_URL"
+          # -j flattens the output path (strips any leading dirs from extracted names).
+          # Patterns cover both root-level entries (e.g. "main.js") and entries nested
+          # inside a top-level directory (e.g. "obsidian-memory-gatekeeper-0.0.2/main.js").
+          unzip -j /tmp/obsidian-memory-gatekeeper.zip \
+            "main.js" "manifest.json" "styles.css" \
+            "*/main.js" "*/manifest.json" "*/styles.css" \
+            -d "$PLUGIN_DIR" || true
+          # Verify all three required files landed — fail loudly if any is missing
+          # so a future upstream layout change is caught at release time.
+          for f in main.js manifest.json styles.css; do
+            if [ ! -f "$PLUGIN_DIR/$f" ]; then
+              echo "::error::Expected plugin file missing after extraction: $PLUGIN_DIR/$f"
+              exit 1
+            fi
+          done
+          echo "Plugin files in $PLUGIN_DIR:"
+          ls -la "$PLUGIN_DIR"
+
       - name: Stage install tree and build release zip
         id: stage
         shell: bash
@@ -83,6 +108,9 @@ jobs:
           # description.md ships onto the orphan release branch so the dispatch
           # payload's description_url resolves at the tagged commit.
           [ -f description.md ] && cp -a description.md "$STAGE/" || true
+          # obsidian-template/ carries the static vault config plus the
+          # downloaded plugin build (main.js/manifest.json/styles.css).
+          [ -d obsidian-template ] && cp -a obsidian-template "$STAGE/" || true
 
           mkdir -p dist
           ZIPNAME="agent-claude-memory-gatekeeper-${{ inputs.version }}.zip"
