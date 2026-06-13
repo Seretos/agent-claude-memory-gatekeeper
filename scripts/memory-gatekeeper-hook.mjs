@@ -2,9 +2,10 @@
 /**
  * PreToolUse hook — memory gatekeeper.
  *
- * Fires on Write and Edit. When the target path is inside Claude Code's
- * file-based memory store (…/projects/<slug>/memory/…), the write is denied
- * and the content is redirected into a gatekeeper tree instead.
+ * Fires on Write, Edit, MultiEdit, NotebookEdit, and Bash. When the target
+ * path is inside Claude Code's file-based memory store
+ * (…/projects/<slug>/memory/…), the write is denied and the content is
+ * redirected into a gatekeeper tree instead.
  *
  * Gatekeeper root resolution (in priority order):
  *   1. $CLAUDE_MEMORY_GATEKEEPER_DIR/<slug>/memory/<rest>
@@ -18,6 +19,15 @@
  *
  * Human review of the gatekeeper copies is an out-of-band manual step.
  * This hook never promotes or approves anything automatically.
+ *
+ * Bash interception:
+ *   - If the command references a memory path, intent is classified:
+ *     - delete-intent: a zero-byte tombstone is seeded in the gatekeeper tree.
+ *     - write-intent: hard deny, no gatekeeper file written.
+ *   - If the command has no memory path reference, it passes through.
+ *
+ * Default-deny (fail-closed): any unrecognised tool name that carries an
+ * in-scope path emits a deny. Out-of-scope / unparseable path → pass-through.
  */
 
 import fs from "node:fs";
@@ -190,19 +200,95 @@ function buildAdditionalContext(gatekeeperPath) {
 /**
  * Emit a PreToolUse deny response to stdout.
  *
- * @param {string} gatekeeperPath — the redirected destination
+ * @param {string} additionalContext — context message for the agent
  */
-function emitDeny(gatekeeperPath) {
+function emitDeny(additionalContext) {
   const reason = "Memory writes are redirected to a separate tree.";
   const output = {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason: reason,
-      additionalContext: buildAdditionalContext(gatekeeperPath),
+      additionalContext,
     },
   };
   process.stdout.write(JSON.stringify(output) + "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Bash-specific helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+/**
+ * Regex that matches a full path ending in the memory-store pattern.
+ *
+ * Uses a \S* prefix to capture any non-whitespace path prefix (e.g. an
+ * absolute path on any platform) before the `projects/` segment.
+ * The `rest` stops at the first whitespace character.
+ *
+ * NOTE: Regex literals cannot include an unescaped `/` inside a character
+ * class in all engines/parsers, so this regex is forward-slash-only.
+ * `parseBashCommand` normalises the command to forward slashes before matching.
+ */
+const MEMORY_PATH_RE = /\S*projects\/[^/\s"';]+\/memory\/\S+/;
+
+/**
+ * Extract the first memory path found anywhere in a Bash command string.
+ *
+ * The command is normalised to forward slashes before matching so that
+ * Windows paths (backslash-separated) are found correctly.
+ * The returned string is in normalised (forward-slash) form.
+ *
+ * @param {string} command — the full Bash command string
+ * @returns {string|null}  — the matched path substring (forward slashes), or null if not found
+ */
+function parseBashCommand(command) {
+  if (typeof command !== "string") return null;
+  // Normalise OS-specific separators to forward slashes for uniform matching.
+  const normalised = command.split(path.sep).join("/");
+  const match = normalised.match(MEMORY_PATH_RE);
+  return match ? match[0] : null;
+}
+
+/**
+ * DELETE_INTENT_RE matches delete verbs as whole words (case-insensitive).
+ * Covered: rm, del, Remove-Item, unlink, truncate, Clear-Content.
+ */
+const DELETE_INTENT_RE =
+  /\b(rm|del|Remove-Item|unlink|truncate|Clear-Content)\b/i;
+
+/**
+ * Classify the intent of a Bash command that references a memory path.
+ *
+ * @param {string} command — the full Bash command string
+ * @returns {"delete"|"write"}
+ */
+function classifyBashIntent(command) {
+  if (DELETE_INTENT_RE.test(command)) return "delete";
+  return "write";
+}
+
+/**
+ * Build deny context for a Bash command that references a memory path.
+ * Contains no approval/pending/review/gatekeeper language.
+ *
+ * @param {string} detectedPath — the memory path extracted from the command
+ * @param {"delete"|"write"} intent — the classified intent
+ * @returns {string}
+ */
+function buildBashDenyContext(detectedPath, intent) {
+  if (intent === "delete") {
+    return (
+      `Memory deletions via Bash are intercepted. ` +
+      `A deletion marker has been recorded for: ${detectedPath}. ` +
+      `No further action is needed.`
+    );
+  }
+  // write intent
+  return (
+    `Memory writes via Bash are not permitted. ` +
+    `Use the Write tool to write to the detected memory path: ${detectedPath}`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -225,15 +311,73 @@ function main() {
     ? input.tool_input
     : {};
 
-  // Both Write and Edit use `file_path` in their tool schema.
-  const targetPath = typeof toolInput.file_path === "string" ? toolInput.file_path : "";
+  const envDir = process.env.CLAUDE_MEMORY_GATEKEEPER_DIR;
+
+  // -------------------------------------------------------------------------
+  // Bash — extract memory path from command string (not from file_path)
+  // -------------------------------------------------------------------------
+
+  if (toolName === "Bash") {
+    const command = typeof toolInput.command === "string" ? toolInput.command : "";
+    const detectedPathRel = parseBashCommand(command);
+    if (!detectedPathRel) {
+      // No memory path found in the command → pass through.
+      process.exit(0);
+    }
+
+    // Build a resolvable absolute path from the relative memory path fragment.
+    // parseBashCommand returns the projects/…/memory/… fragment; we need to
+    // resolve it to extract slug/rest. Use process.cwd() as the base for
+    // path.resolve so it behaves consistently.
+    //
+    // If the command contains an absolute path the fragment will still start
+    // from `projects/` but may be preceded by a prefix — that's fine because
+    // parseMemoryPath does a suffix match.
+    const parsed = parseMemoryPath(path.resolve(detectedPathRel));
+    if (!parsed) {
+      // Unparseable → pass through (fault-tolerant).
+      process.exit(0);
+    }
+
+    const intent = classifyBashIntent(command);
+    const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
+    const gatekeeperDir = path.dirname(gatekeeperPath);
+    const additionalContext = buildBashDenyContext(detectedPathRel, intent);
+
+    if (intent === "delete") {
+      // Seed a zero-byte tombstone in the gatekeeper tree.
+      fs.mkdirSync(gatekeeperDir, { recursive: true });
+      fs.writeFileSync(gatekeeperPath, "");
+      const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+      bootstrapObsidian(gatekeeperRoot, parsed.base);
+    }
+    // write-intent: hard deny, no gatekeeper file written.
+
+    emitDeny(additionalContext);
+    process.exit(0);
+  }
+
+  // -------------------------------------------------------------------------
+  // All other tools: extract target path from tool_input
+  // -------------------------------------------------------------------------
+
+  // NotebookEdit uses notebook_path; Write/Edit/MultiEdit use file_path.
+  let targetPath = "";
+  if (toolName === "NotebookEdit") {
+    targetPath =
+      typeof toolInput.notebook_path === "string" ? toolInput.notebook_path :
+      typeof toolInput.file_path === "string" ? toolInput.file_path :
+      "";
+  } else {
+    targetPath = typeof toolInput.file_path === "string" ? toolInput.file_path : "";
+  }
+
   if (!targetPath) process.exit(0);
 
   // Scope test: must match …/projects/<slug>/memory/…
   const parsed = parseMemoryPath(targetPath);
   if (!parsed) process.exit(0);
 
-  const envDir = process.env.CLAUDE_MEMORY_GATEKEEPER_DIR;
   const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
   const gatekeeperDir = path.dirname(gatekeeperPath);
 
@@ -241,13 +385,13 @@ function main() {
     const content = typeof toolInput.content === "string" ? toolInput.content : "";
     fs.mkdirSync(gatekeeperDir, { recursive: true });
     fs.writeFileSync(gatekeeperPath, content);
-    emitDeny(gatekeeperPath);
+    emitDeny(buildAdditionalContext(gatekeeperPath));
     const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
     bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
 
-  if (toolName === "Edit") {
+  if (toolName === "Edit" || toolName === "MultiEdit") {
     const liveFilePath = path.resolve(targetPath);
     const editCase = classifyEditCase(gatekeeperPath, liveFilePath);
 
@@ -262,13 +406,36 @@ function main() {
     }
     // "deny-existing": gatekeeper copy already there — no re-seed.
 
-    emitDeny(gatekeeperPath);
+    emitDeny(buildAdditionalContext(gatekeeperPath));
     const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
     bootstrapObsidian(gatekeeperRoot, parsed.base);
     process.exit(0);
   }
 
-  // Unknown tool name — pass through.
+  if (toolName === "NotebookEdit") {
+    const liveFilePath = path.resolve(targetPath);
+    const editCase = classifyEditCase(gatekeeperPath, liveFilePath);
+
+    if (editCase === "pass-through") {
+      process.exit(0);
+    }
+
+    if (editCase === "seed-and-deny") {
+      fs.mkdirSync(gatekeeperDir, { recursive: true });
+      fs.copyFileSync(liveFilePath, gatekeeperPath);
+    }
+
+    emitDeny(buildAdditionalContext(gatekeeperPath));
+    const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
+    bootstrapObsidian(gatekeeperRoot, parsed.base);
+    process.exit(0);
+  }
+
+  // -------------------------------------------------------------------------
+  // Default-deny: unknown tool name with an in-scope path → deny (fail closed).
+  // The path was already parsed and confirmed in-scope above.
+  // -------------------------------------------------------------------------
+  emitDeny(buildAdditionalContext(gatekeeperPath));
   process.exit(0);
 }
 
@@ -280,6 +447,9 @@ export {
   classifyEditCase,
   buildAdditionalContext,
   bootstrapObsidian,
+  parseBashCommand,
+  classifyBashIntent,
+  buildBashDenyContext,
 };
 
 // Only run main() when executed directly (not imported as a module).
