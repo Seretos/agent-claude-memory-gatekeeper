@@ -1,0 +1,4 @@
+# Downloaded at release time — do not commit the plugin build files.
+main.js
+manifest.json
+styles.css

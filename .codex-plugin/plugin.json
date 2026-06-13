@@ -1,0 +1,13 @@
+{
+  "name": "agent-claude-memory-gatekeeper",
+  "version": "0.0.2",
+  "description": "Intercepts Claude's memory-save process and redirects new memories into a review folder, so you can approve them before they are persisted and shared.",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "repository": "https://github.com/Seretos/agent-claude-memory-gatekeeper",
+  "interface": {
+    "displayName": "Agent Claude Memory Gatekeeper",
+    "shortDescription": "Intercepts Claude's memory-save process and redirects new memories into a review folder, so you can approve them before they are persisted and shared."
+  }
+}
