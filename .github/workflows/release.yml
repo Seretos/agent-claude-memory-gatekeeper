@@ -63,16 +63,16 @@ jobs:
           done
           echo "Stamped version $V"
 
-      - name: Download obsidian-memory-gatekeeper v0.0.2 plugin build
+      - name: Download obsidian-memory-gatekeeper v0.0.3 plugin build
         shell: bash
         run: |
           PLUGIN_DIR="obsidian-template/.obsidian/plugins/memory-gatekeeper"
           mkdir -p "$PLUGIN_DIR"
-          ZIP_URL="https://github.com/Seretos/obsidian-memory-gatekeeper/releases/download/v0.0.2/obsidian-memory-gatekeeper-0.0.2.zip"
+          ZIP_URL="https://github.com/Seretos/obsidian-memory-gatekeeper/releases/download/v0.0.3/obsidian-memory-gatekeeper-0.0.3.zip"
           curl -fsSL -o /tmp/obsidian-memory-gatekeeper.zip "$ZIP_URL"
           # -j flattens the output path (strips any leading dirs from extracted names).
           # Patterns cover both root-level entries (e.g. "main.js") and entries nested
-          # inside a top-level directory (e.g. "obsidian-memory-gatekeeper-0.0.2/main.js").
+          # inside a top-level directory (e.g. "obsidian-memory-gatekeeper-0.0.3/main.js").
           unzip -j /tmp/obsidian-memory-gatekeeper.zip \
             "main.js" "manifest.json" "styles.css" \
             "*/main.js" "*/manifest.json" "*/styles.css" \
