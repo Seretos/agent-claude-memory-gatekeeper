@@ -20,6 +20,9 @@ import {
   classifyEditCase,
   buildAdditionalContext,
   bootstrapObsidian,
+  parseBashCommand,
+  classifyBashIntent,
+  buildBashDenyContext,
 } from "./memory-gatekeeper-hook.mjs";
 
 const HOOK_SCRIPT = path.resolve(
@@ -136,6 +139,44 @@ function makeEditEvent(filePath) {
   return {
     tool_name: "Edit",
     tool_input: { file_path: filePath, old_string: "a", new_string: "b" },
+  };
+}
+
+/**
+ * Build a MultiEdit tool event for the given file path.
+ */
+function makeMultiEditEvent(filePath) {
+  return {
+    tool_name: "MultiEdit",
+    tool_input: {
+      file_path: filePath,
+      edits: [{ old_string: "a", new_string: "b" }],
+    },
+  };
+}
+
+/**
+ * Build a NotebookEdit tool event for the given notebook path.
+ * NotebookEdit uses notebook_path, not file_path.
+ */
+function makeNotebookEditEvent(notebookPath) {
+  return {
+    tool_name: "NotebookEdit",
+    tool_input: {
+      notebook_path: notebookPath,
+      cell_type: "code",
+      source: "print('hello')",
+    },
+  };
+}
+
+/**
+ * Build a Bash tool event for the given command string.
+ */
+function makeBashEvent(command) {
+  return {
+    tool_name: "Bash",
+    tool_input: { command },
   };
 }
 
@@ -358,6 +399,120 @@ test("bootstrapObsidian: error path (gatekeeperRoot is a file) → no throw", ()
 });
 
 // ---------------------------------------------------------------------------
+// Unit tests — Bash helpers
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests: parseBashCommand ---");
+
+test("parseBashCommand: returns null for command with no memory path", () => {
+  assertEqual(parseBashCommand("ls -la /home/user"), null, "no memory path");
+});
+
+test("parseBashCommand: returns null for non-string input", () => {
+  assertEqual(parseBashCommand(null), null, "null input");
+  assertEqual(parseBashCommand(undefined), null, "undefined input");
+});
+
+test("parseBashCommand: detects memory path as first token", () => {
+  const result = parseBashCommand("cat projects/my-slug/memory/NOTE.md");
+  assert(result !== null, "should match");
+  assert(result.includes("projects/my-slug/memory/NOTE.md"), `got: ${result}`);
+});
+
+test("parseBashCommand: detects memory path mid-string", () => {
+  const result = parseBashCommand("rm -f /base/projects/my-slug/memory/NOTE.md --force");
+  assert(result !== null, "should match mid-string");
+  assert(result.includes("projects/my-slug/memory/NOTE.md"), `got: ${result}`);
+});
+
+test("parseBashCommand: detects memory path at end of string", () => {
+  const result = parseBashCommand("cat /some/prefix/projects/my-slug/memory/sub/dir/NOTE.md");
+  assert(result !== null, "should match");
+  assert(result.includes("projects/my-slug/memory/sub/dir/NOTE.md"), `got: ${result}`);
+});
+
+test("parseBashCommand: returns null for projects/<slug>/CLAUDE.md (no memory segment)", () => {
+  const result = parseBashCommand("cat projects/my-slug/CLAUDE.md");
+  assertEqual(result, null, "no memory segment");
+});
+
+console.log("\n--- Unit tests: classifyBashIntent ---");
+
+test("classifyBashIntent: rm → delete", () => {
+  assertEqual(classifyBashIntent("rm projects/slug/memory/NOTE.md"), "delete", "rm");
+});
+
+test("classifyBashIntent: rm -rf → delete", () => {
+  assertEqual(classifyBashIntent("rm -rf projects/slug/memory/NOTE.md"), "delete", "rm -rf");
+});
+
+test("classifyBashIntent: del → delete", () => {
+  assertEqual(classifyBashIntent("del projects/slug/memory/NOTE.md"), "delete", "del");
+});
+
+test("classifyBashIntent: Remove-Item → delete (PowerShell)", () => {
+  assertEqual(classifyBashIntent("Remove-Item projects/slug/memory/NOTE.md"), "delete", "Remove-Item");
+});
+
+test("classifyBashIntent: remove-item case-insensitive → delete", () => {
+  assertEqual(classifyBashIntent("remove-item projects/slug/memory/NOTE.md"), "delete", "remove-item lower");
+});
+
+test("classifyBashIntent: unlink → delete", () => {
+  assertEqual(classifyBashIntent("unlink projects/slug/memory/NOTE.md"), "delete", "unlink");
+});
+
+test("classifyBashIntent: truncate → delete", () => {
+  assertEqual(classifyBashIntent("truncate -s 0 projects/slug/memory/NOTE.md"), "delete", "truncate");
+});
+
+test("classifyBashIntent: Clear-Content → delete (PowerShell)", () => {
+  assertEqual(classifyBashIntent("Clear-Content projects/slug/memory/NOTE.md"), "delete", "Clear-Content");
+});
+
+test("classifyBashIntent: cat (read) → write", () => {
+  assertEqual(classifyBashIntent("cat projects/slug/memory/NOTE.md"), "write", "cat");
+});
+
+test("classifyBashIntent: echo redirect → write", () => {
+  assertEqual(classifyBashIntent("echo hello > projects/slug/memory/NOTE.md"), "write", "echo");
+});
+
+test("classifyBashIntent: cp → write", () => {
+  assertEqual(classifyBashIntent("cp file.txt projects/slug/memory/NOTE.md"), "write", "cp");
+});
+
+console.log("\n--- Unit tests: buildBashDenyContext ---");
+
+test("buildBashDenyContext: delete intent contains detected path", () => {
+  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "delete");
+  assert(ctx.includes("projects/slug/memory/NOTE.md"), "contains path");
+});
+
+test("buildBashDenyContext: write intent mentions Write tool and detected path", () => {
+  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "write");
+  assert(ctx.includes("projects/slug/memory/NOTE.md"), "contains path");
+  assert(ctx.includes("Write"), "mentions Write tool");
+});
+
+test("buildBashDenyContext: delete intent has no forbidden words", () => {
+  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "delete").toLowerCase();
+  // Strip the embedded path first (may contain segments like 'memory').
+  const proseOnly = ctx.replace("projects/slug/memory/note.md", "");
+  for (const word of ["approval", "pending", "review", "gatekeeper"]) {
+    assert(!proseOnly.includes(word), `delete context must not contain '${word}'`);
+  }
+});
+
+test("buildBashDenyContext: write intent has no forbidden words", () => {
+  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "write").toLowerCase();
+  const proseOnly = ctx.replace("projects/slug/memory/note.md", "");
+  for (const word of ["approval", "pending", "review", "gatekeeper"]) {
+    assert(!proseOnly.includes(word), `write context must not contain '${word}'`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // End-to-end tests — via spawned process
 // ---------------------------------------------------------------------------
 
@@ -570,6 +725,271 @@ test("Empty stdin → exit 0, no write, no output", () => {
   const result = runHookRaw("");
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stdout.trim(), "", "no output");
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end tests — MultiEdit
+// ---------------------------------------------------------------------------
+
+console.log("\n--- End-to-end tests: MultiEdit ---");
+
+test("MultiEdit in-scope, only live exists → gatekeeper seeded from live, deny", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-multiedit1", "LIVE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live original content");
+
+  const result = runHook(makeMultiEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "LIVE.md");
+  assert(fs.existsSync(gkPath), "gatekeeper copy created");
+  assertEqual(fs.readFileSync(gkPath, "utf8"), "live original content", "seeded from live");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("MultiEdit in-scope, gatekeeper copy already exists → no re-seed, deny", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-multiedit2", "GK.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "GK.md");
+  fs.mkdirSync(path.dirname(gkPath), { recursive: true });
+  fs.writeFileSync(gkPath, "gatekeeper original content");
+
+  const result = runHook(makeMultiEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+  assertEqual(fs.readFileSync(gkPath, "utf8"), "gatekeeper original content", "content preserved");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("MultiEdit in-scope, neither gatekeeper nor live exists → pass-through", () => {
+  const { base, liveFile } = makeTempBase("slug-multiedit3", "GHOST.md");
+
+  const result = runHook(makeMultiEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output on pass-through");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("MultiEdit out-of-scope → no output, exit 0", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-oos-"));
+  const filePath = path.join(tmpDir, "some", "other", "file.md");
+
+  const result = runHook(makeMultiEditEvent(filePath));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output");
+
+  fs.rmSync(tmpDir, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end tests — NotebookEdit
+// ---------------------------------------------------------------------------
+
+console.log("\n--- End-to-end tests: NotebookEdit ---");
+
+test("NotebookEdit in-scope via notebook_path, live exists → deny", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-nbedit1", "notebook.ipynb");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, '{"cells": []}');
+
+  const result = runHook(makeNotebookEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "notebook.ipynb");
+  assert(fs.existsSync(gkPath), "gatekeeper copy created");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("NotebookEdit in-scope via notebook_path, neither exists → pass-through", () => {
+  const { base, liveFile } = makeTempBase("slug-nbedit2", "ghost.ipynb");
+
+  const result = runHook(makeNotebookEditEvent(liveFile));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output on pass-through");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("NotebookEdit out-of-scope → no output, exit 0", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-oos-"));
+  const filePath = path.join(tmpDir, "some", "notebook.ipynb");
+
+  const result = runHook(makeNotebookEditEvent(filePath));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output");
+
+  fs.rmSync(tmpDir, { recursive: true });
+});
+
+test("NotebookEdit missing notebook_path field → pass-through (fault-tolerant)", () => {
+  // Send a NotebookEdit event with neither notebook_path nor file_path.
+  const result = runHook({
+    tool_name: "NotebookEdit",
+    tool_input: { cell_type: "code", source: "print('hello')" },
+  });
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output when path missing");
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end tests — Bash
+// ---------------------------------------------------------------------------
+
+console.log("\n--- End-to-end tests: Bash ---");
+
+test("Bash: no memory path in command → pass-through, exit 0", () => {
+  const result = runHook(makeBashEvent("ls -la /home/user && echo done"));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output");
+});
+
+test("Bash write-intent (cat redirect) → deny, NO gatekeeper file written", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash1", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  // liveFile = <base>/projects/slug-bash1/memory/NOTE.md
+
+  const command = `cat some_file.txt > ${liveFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  // No gatekeeper file should be written for write-intent.
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(!fs.existsSync(gkPath), "no gatekeeper file for write-intent");
+
+  // additionalContext must mention Write tool.
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(ctx.includes("Write"), "mentions Write tool");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash write-intent additionalContext has no forbidden words", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash2", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+
+  const command = `echo hello > ${liveFile}`;
+  const result = runHook(makeBashEvent(command));
+  const out = JSON.parse(result.stdout.trim());
+  const ctx = out.hookSpecificOutput.additionalContext.toLowerCase();
+
+  // Strip path segments before forbidden-word check.
+  const pathFragment = `projects/slug-bash2/memory/note.md`;
+  const proseOnly = ctx.replace(new RegExp(pathFragment.replace(/\//g, "."), "gi"), "");
+  for (const word of ["approval", "pending", "review", "gatekeeper"]) {
+    assert(!proseOnly.includes(word), `Bash write context must not contain '${word}'`);
+  }
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash delete-intent (rm) → deny + zero-byte tombstone created", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash3", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const command = `rm ${liveFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(fs.existsSync(gkPath), "tombstone file created");
+  assertEqual(fs.readFileSync(gkPath).length, 0, "tombstone is zero-byte");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash delete-intent (Remove-Item) → deny + zero-byte tombstone", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash4", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const command = `Remove-Item -Path ${liveFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(fs.existsSync(gkPath), "tombstone created for Remove-Item");
+  assertEqual(fs.readFileSync(gkPath).length, 0, "tombstone is zero-byte");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash delete-intent (rm -rf mid-string) → deny + tombstone", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash5", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  // Memory path appears mid-string (not first token).
+  const command = `echo before && rm -rf ${liveFile} && echo after`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(fs.existsSync(gkPath), "tombstone created for mid-string rm");
+  assertEqual(fs.readFileSync(gkPath).length, 0, "tombstone is zero-byte");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end tests — Default-deny (fail-closed)
+// ---------------------------------------------------------------------------
+
+console.log("\n--- End-to-end tests: Default-deny ---");
+
+test("Unknown tool + in-scope path → deny (fail-closed)", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-unknown1", "NOTE.md");
+
+  const result = runHook({
+    tool_name: "FutureTool",
+    tool_input: { file_path: liveFile },
+  });
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for unknown tool in-scope");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Unknown tool + out-of-scope path → pass-through", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-oos-"));
+  const filePath = path.join(tmpDir, "some", "other", "file.md");
+
+  const result = runHook({
+    tool_name: "FutureTool",
+    tool_input: { file_path: filePath },
+  });
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no output for out-of-scope unknown tool");
+
+  fs.rmSync(tmpDir, { recursive: true });
 });
 
 // ---------------------------------------------------------------------------

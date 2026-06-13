@@ -1,9 +1,9 @@
 {
-  "description": "Intercepts Write and Edit calls targeting Claude Code's memory store and redirects them into a configurable gatekeeper tree, so memories can be reviewed before being promoted.",
+  "description": "Intercepts Write, Edit, MultiEdit, NotebookEdit, and Bash calls targeting Claude Code's memory store and redirects them into a configurable gatekeeper tree for manual human promotion.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [
           {
             "type": "command",
