@@ -220,6 +220,46 @@ function bootstrapObsidian(
 }
 
 /**
+ * Generate (or regenerate) a MEMORY.md index inside a gatekeeper memory directory.
+ *
+ * Lists every `.md` file in `gatekeeperMemoryDir` (excluding MEMORY.md itself),
+ * sorted alphabetically, and writes:
+ *
+ *   # Memory Index
+ *
+ *   - [<name without .md>](<filename>)
+ *   …
+ *
+ * Fault-tolerant: any error is written to stderr and the function returns without
+ * throwing — the hook must never crash Claude Code.
+ *
+ * @param {string} gatekeeperMemoryDir — absolute path to the gatekeeper memory directory
+ */
+function generateMemoryIndex(gatekeeperMemoryDir) {
+  try {
+    const entries = fs.readdirSync(gatekeeperMemoryDir);
+    const mdFiles = entries
+      .filter((name) => name.endsWith(".md") && name !== "MEMORY.md")
+      .sort();
+    let content = "# Memory Index\n";
+    if (mdFiles.length > 0) {
+      content += "\n";
+      for (const filename of mdFiles) {
+        const displayName = filename.slice(0, -3); // strip .md
+        content += `- [${displayName}](${filename})\n`;
+      }
+    }
+    fs.writeFileSync(path.join(gatekeeperMemoryDir, "MEMORY.md"), content);
+  } catch (err) {
+    process.stderr.write(
+      `memory-gatekeeper-hook: generateMemoryIndex error: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`
+    );
+  }
+}
+
+/**
  * Derive the project name from the current working directory.
  *
  * @returns {string} — the last path segment of process.cwd()
@@ -579,6 +619,7 @@ function main() {
         fs.writeFileSync(gatekeeperPath, "");
         const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
         bootstrapObsidian(gatekeeperRoot, parsed.base);
+        generateMemoryIndex(gatekeeperDir);
       } catch (err) {
         process.stderr.write(
           `memory-gatekeeper-hook: tombstone write failed: ${err instanceof Error ? err.message : String(err)}\n`
@@ -664,6 +705,7 @@ function main() {
     fs.writeFileSync(gatekeeperPath, stampedContent);
     emitDeny(buildAdditionalContext(gatekeeperPath));
     bootstrapObsidian(gatekeeperRoot, parsed.base);
+    generateMemoryIndex(gatekeeperDir);
     process.exit(0);
   }
 
@@ -698,6 +740,7 @@ function main() {
             // Edit apply failed — fall through with seeded content, emit divergent.
             emitDeny(buildDivergentContext(gatekeeperPath));
             bootstrapObsidian(gatekeeperRoot, parsed.base);
+            generateMemoryIndex(gatekeeperDir);
             process.exit(0);
           }
         } else {
@@ -721,6 +764,7 @@ function main() {
           if (applyFailed) {
             emitDeny(buildDivergentContext(gatekeeperPath));
             bootstrapObsidian(gatekeeperRoot, parsed.base);
+            generateMemoryIndex(gatekeeperDir);
             process.exit(0);
           }
           fs.writeFileSync(gatekeeperPath, currentContent);
@@ -728,6 +772,7 @@ function main() {
 
         emitDeny(buildAppliedContext(gatekeeperPath));
         bootstrapObsidian(gatekeeperRoot, parsed.base);
+        generateMemoryIndex(gatekeeperDir);
         process.exit(0);
       } catch {
         // Any FS error during seed — emit divergent feedback.
@@ -760,6 +805,7 @@ function main() {
         } catch {
           emitDeny(buildDivergentContext(gatekeeperPath));
           bootstrapObsidian(gatekeeperRoot, parsed.base);
+          generateMemoryIndex(gatekeeperDir);
           process.exit(0);
         }
         let applyFailed = false;
@@ -788,12 +834,14 @@ function main() {
         }
       }
       bootstrapObsidian(gatekeeperRoot, parsed.base);
+      generateMemoryIndex(gatekeeperDir);
       process.exit(0);
     }
 
     // editCase === "divergent"
     emitDeny(buildDivergentContext(gatekeeperPath));
     bootstrapObsidian(gatekeeperRoot, parsed.base);
+    generateMemoryIndex(gatekeeperDir);
     process.exit(0);
   }
 
@@ -816,6 +864,7 @@ function main() {
 
     emitDeny(buildAdditionalContext(gatekeeperPath));
     bootstrapObsidian(gatekeeperRoot, parsed.base);
+    generateMemoryIndex(gatekeeperDir);
     process.exit(0);
   }
 
@@ -849,6 +898,8 @@ export {
   buildEmptyWriteDenyContext,
   // New export for ticket #14
   parseGatekeeperTreePath,
+  // New export for ticket #15
+  generateMemoryIndex,
 };
 
 // Only run main() when executed directly (not imported as a module).
