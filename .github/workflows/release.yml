@@ -111,6 +111,8 @@ jobs:
           # obsidian-template/ carries the static vault config plus the
           # downloaded plugin build (main.js/manifest.json/styles.css).
           if [ -d obsidian-template ]; then cp -a obsidian-template "$STAGE/"; fi
+          # skills/ contains SKILL.md files that teach agents how to use this plugin.
+          if [ -d skills ]; then cp -a skills "$STAGE/"; fi
 
           mkdir -p dist
           ZIPNAME="agent-claude-memory-gatekeeper-${{ inputs.version }}.zip"
