@@ -34,6 +34,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for tests)
@@ -220,12 +221,41 @@ function bootstrapObsidian(
 }
 
 /**
- * Derive the project name from the current working directory.
+ * Derive the project name from the canonical Git repository root.
  *
- * @returns {string} — the last path segment of process.cwd()
+ * Runs `git rev-parse --git-common-dir` from the given `cwd` to locate the
+ * shared `.git` directory. This resolves correctly for both main checkouts
+ * (returns `.git`, relative) and linked worktrees (returns the absolute path
+ * to the principal `.git` directory). The project name is then derived as
+ * `path.basename` of the directory that *contains* `.git`, i.e. the repo root.
+ *
+ * All error paths (git unavailable, not a git repo, blank output) fall back
+ * to `path.basename(cwd)` — the previous behaviour — so the hook remains
+ * fault-tolerant.
+ *
+ * @param {string} [cwd] — directory to resolve from (defaults to process.cwd())
+ * @returns {string}     — the project name (last path segment of the repo root, or of cwd on fallback)
  */
-function deriveProjectName() {
-  return path.basename(process.cwd());
+function deriveProjectName(cwd = process.cwd()) {
+  try {
+    const result = spawnSync("git", ["rev-parse", "--git-common-dir"], {
+      cwd,
+      encoding: "utf8",
+    });
+    // If git is unavailable (ENOENT), result.error is set.
+    // If not a git repo, result.status is non-zero.
+    if (!result.error && result.status === 0 && result.stdout && result.stdout.trim()) {
+      const trimmed = result.stdout.trim();
+      // Resolve to absolute (may be relative like ".git" for a main checkout,
+      // or already absolute for a linked worktree).
+      const resolvedGitDir = path.resolve(cwd, trimmed);
+      // The repo root is the parent of the .git directory.
+      return path.basename(path.dirname(resolvedGitDir));
+    }
+  } catch {
+    // Fall through to basename fallback.
+  }
+  return path.basename(cwd);
 }
 
 /**
