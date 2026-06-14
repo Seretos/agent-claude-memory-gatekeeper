@@ -104,13 +104,13 @@ jobs:
           # assets/ goes onto the orphan release branch so the dispatch
           # payload's icon URL (raw.githubusercontent.com/${repo}/${TAG}/
           # assets/icon.png) resolves.
-          [ -d assets ] && cp -a assets "$STAGE/" || true
+          if [ -d assets ]; then cp -a assets "$STAGE/"; fi
           # description.md ships onto the orphan release branch so the dispatch
           # payload's description_url resolves at the tagged commit.
-          [ -f description.md ] && cp -a description.md "$STAGE/" || true
+          if [ -f description.md ]; then cp -a description.md "$STAGE/"; fi
           # obsidian-template/ carries the static vault config plus the
           # downloaded plugin build (main.js/manifest.json/styles.css).
-          [ -d obsidian-template ] && cp -a obsidian-template "$STAGE/" || true
+          if [ -d obsidian-template ]; then cp -a obsidian-template "$STAGE/"; fi
 
           mkdir -p dist
           ZIPNAME="agent-claude-memory-gatekeeper-${{ inputs.version }}.zip"
@@ -157,12 +157,29 @@ jobs:
 
           cp -a "$TMP"/. .
 
+          # Remove the plugin .gitignore that exists solely to keep main clean.
+          # On the orphan release branch it would cause git add -A to silently
+          # skip main.js/manifest.json/styles.css, shipping clients a broken build.
+          rm -f obsidian-template/.obsidian/plugins/memory-gatekeeper/.gitignore
+
           echo "=== release branch contents ==="
           find . -mindepth 1 -not -path './.git*' | sort
 
           git add -A
           git commit -m "release: v${{ inputs.version }}"
           git push origin release --force
+
+          # Verify the three plugin build artifacts are actually tracked in the
+          # orphan commit — fail loudly if any is missing so a regression is
+          # caught at release time rather than silently shipping a broken build.
+          PLUGIN_PATH="obsidian-template/.obsidian/plugins/memory-gatekeeper"
+          for f in main.js manifest.json styles.css; do
+            if ! git cat-file -e "HEAD:${PLUGIN_PATH}/${f}" 2>/dev/null; then
+              echo "::error::Plugin artifact missing from orphan release commit: ${PLUGIN_PATH}/${f}"
+              exit 1
+            fi
+          done
+          echo "Verified: all three plugin artifacts are present in the release commit."
 
           SHA=$(git rev-parse HEAD)
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
