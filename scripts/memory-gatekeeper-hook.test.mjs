@@ -2103,6 +2103,146 @@ test("Regression #16 (alternate verb): Bash unlink on gatekeeper-tree path → d
 });
 
 // ---------------------------------------------------------------------------
+// Unit tests — ticket #17: deriveProjectName uses canonical git repo root
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests (ticket #17): deriveProjectName git-worktree slug ---");
+
+// Check once whether git is available on this runner.
+const _gitCheck = spawnSync("git", ["--version"], { encoding: "utf8" });
+const _gitAvailable = !_gitCheck.error && _gitCheck.status === 0;
+
+// Helper: create a temp git repo and return its real path (resolves macOS /var → /private/var).
+function makeTempGitRepo(name) {
+  const base = fs.realpathSync(os.tmpdir());
+  const repoDir = fs.mkdtempSync(path.join(base, `mem-gk-17-${name}-`));
+  spawnSync("git", ["init", "-b", "main"], { cwd: repoDir, encoding: "utf8" });
+  // Tolerate runners where -b is not supported (git < 2.28).
+  // Ensure the repo has at least a HEAD so worktree add works.
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir, encoding: "utf8" });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repoDir, encoding: "utf8" });
+  return repoDir;
+}
+
+// Test 1: Main checkout — deriveProjectName returns basename of the repo dir.
+test("deriveProjectName: main checkout returns basename of repo root", () => {
+  if (!_gitAvailable) {
+    console.log("        (skipped — git not available on this runner)");
+    return;
+  }
+  const repoDir = makeTempGitRepo("main");
+  try {
+    const result = deriveProjectName(repoDir);
+    assertEqual(result, path.basename(repoDir), "main checkout returns repo basename");
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+// Test 2: Worktree regression — the core test.
+// deriveProjectName called from a worktree dir must return the CANONICAL repo
+// name, not the worktree directory basename.
+test("Regression #17: deriveProjectName from a linked worktree returns canonical repo name", () => {
+  if (!_gitAvailable) {
+    console.log("        (skipped — git not available on this runner)");
+    return;
+  }
+
+  // The canonical repo name is the basename of the main repo directory.
+  const repoDir = makeTempGitRepo("canonical-project-name");
+  const canonicalName = path.basename(repoDir);
+
+  // Create an initial commit so `git worktree add` works.
+  spawnSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: repoDir, encoding: "utf8" });
+
+  // Create the worktree in a directory whose basename DIFFERS from the repo name.
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, `mem-gk-17-wt-fix-abc123-`));
+  // Remove the pre-created dir so git worktree add can create it.
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+
+  try {
+    const addResult = spawnSync(
+      "git",
+      ["worktree", "add", worktreeDir, "HEAD"],
+      { cwd: repoDir, encoding: "utf8" }
+    );
+
+    if (addResult.error || addResult.status !== 0) {
+      // git worktree add failed on this runner — skip gracefully.
+      console.log(`        (skipped — git worktree add failed: ${addResult.stderr || addResult.error})`);
+      return;
+    }
+
+    // Sanity: the worktree basename must differ from the canonical repo name.
+    assert(
+      path.basename(worktreeDir) !== canonicalName,
+      `worktree basename (${path.basename(worktreeDir)}) should differ from canonical name (${canonicalName})`
+    );
+
+    const result = deriveProjectName(worktreeDir);
+    assertEqual(
+      result,
+      canonicalName,
+      `worktree should resolve to canonical repo name "${canonicalName}", got "${result}"`
+    );
+  } finally {
+    // Clean up worktree first, then the repo.
+    spawnSync("git", ["worktree", "remove", "--force", worktreeDir], { cwd: repoDir, encoding: "utf8" });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    // Worktree dir may already be removed by git; ignore errors.
+    try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* noop */ }
+  }
+});
+
+// Test 3: Fallback — not a git repo.
+// A plain temp dir with no .git → deriveProjectName falls back to path.basename(cwd).
+test("deriveProjectName: non-git dir falls back to path.basename(cwd)", () => {
+  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-17-plain-"));
+  try {
+    const result = deriveProjectName(plainDir);
+    assertEqual(result, path.basename(plainDir), "non-git dir falls back to basename");
+  } finally {
+    fs.rmSync(plainDir, { recursive: true, force: true });
+  }
+});
+
+// Test 4: Fallback — git unavailable (or PATH restricted).
+// We exercise the fallback by passing a directory that is guaranteed NOT a git
+// repo (os.tmpdir() itself typically has no .git), with a manipulated PATH that
+// excludes git. If PATH manipulation doesn't prevent git on this platform, we
+// accept the basename result either way — the important thing is that the
+// function does NOT throw.
+test("deriveProjectName: git unavailable → falls back to basename, does not throw", () => {
+  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-17-nogit-"));
+  try {
+    // Attempt with an empty PATH so spawnSync cannot find git.
+    // On some platforms PATH manipulation may not work perfectly, but the
+    // function must never throw.
+    let result;
+    let threw = false;
+    try {
+      // Temporarily override PATH inside a closure by saving/restoring env.
+      const origPath = process.env.PATH;
+      process.env.PATH = "";
+      try {
+        result = deriveProjectName(plainDir);
+      } finally {
+        process.env.PATH = origPath;
+      }
+    } catch (err) {
+      threw = true;
+    }
+    assert(!threw, "deriveProjectName must not throw even when git is unavailable");
+    // Result should be the basename of the directory (fallback).
+    // (If git somehow still ran and found no repo, it would also return basename.)
+    assertEqual(result, path.basename(plainDir), "falls back to basename when git unavailable");
+  } finally {
+    fs.rmSync(plainDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
