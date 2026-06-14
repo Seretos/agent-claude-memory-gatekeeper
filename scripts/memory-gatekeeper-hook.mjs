@@ -124,6 +124,47 @@ function isInsideGatekeeperTree(resolvedTarget, gatekeeperRoot) {
 }
 
 /**
+ * Parse a file path that lives directly inside a gatekeeper tree.
+ *
+ * Handles two cases (in priority order):
+ *   1. Env-var root:     <envDir>/<slug>/memory/<rest>
+ *      — only when envDir is set and is an absolute path.
+ *   2. Default root:     …/gatekeeper/<slug>/memory/<rest>
+ *
+ * Returns `{ slug, rest }` or `null` when the path does not match either form.
+ * This is the fallback for paths that have no `projects/` segment and therefore
+ * cannot be matched by parseMemoryPath.
+ *
+ * @param {string} filePath — the target path (may be relative; will be resolved)
+ * @param {string} [envDir] — value of CLAUDE_MEMORY_GATEKEEPER_DIR (may be undefined)
+ * @returns {{ slug: string, rest: string }|null}
+ */
+function parseGatekeeperTreePath(filePath, envDir) {
+  const resolved = path.resolve(filePath);
+  const normalised = normalisePath(resolved);
+
+  // Case 1: env-var custom root — <envDir>/<slug>/memory/<rest>
+  if (envDir && path.isAbsolute(envDir)) {
+    const normEnvDir = normalisePath(envDir);
+    // Strip trailing slash for uniform prefix matching.
+    const normRoot = normEnvDir.endsWith("/") ? normEnvDir.slice(0, -1) : normEnvDir;
+    const prefix = normRoot + "/";
+    if (normalised.startsWith(prefix)) {
+      const remainder = normalised.slice(prefix.length);
+      // Expect: <slug>/memory/<rest>
+      const m = remainder.match(/^([^/]+)\/memory\/(.+)$/);
+      if (m) return { slug: m[1], rest: m[2] };
+    }
+  }
+
+  // Case 2: default gatekeeper root — …/gatekeeper/<slug>/memory/<rest>
+  const m = normalised.match(/\/gatekeeper\/([^/]+)\/memory\/(.+)$/);
+  if (m) return { slug: m[1], rest: m[2] };
+
+  return null;
+}
+
+/**
  * Bootstrap a valid Obsidian vault at `gatekeeperRoot` if `.obsidian` is absent.
  *
  * Idempotent: if `.obsidian` already exists, returns immediately.
@@ -570,7 +611,17 @@ function main() {
 
   // Scope test: must match …/projects/<slug>/memory/…
   const parsed = parseMemoryPath(targetPath);
-  if (!parsed) process.exit(0);
+  if (!parsed) {
+    // Fallback: check whether the target is a direct write into a gatekeeper tree
+    // (path has no `projects/` segment — e.g. <base>/gatekeeper/<slug>/memory/<rest>
+    // or <envDir>/<slug>/memory/<rest>).  MEMORY.md writes must be denied; all
+    // other gatekeeper-tree paths are already in the safe zone → pass through.
+    const gkParsed = parseGatekeeperTreePath(targetPath, envDir);
+    if (gkParsed && gkParsed.rest === "MEMORY.md") {
+      emitDeny(buildMemoryMdDenyContext());
+    }
+    process.exit(0);
+  }
 
   const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
   const gatekeeperDir = path.dirname(gatekeeperPath);
@@ -581,6 +632,10 @@ function main() {
   // -------------------------------------------------------------------------
   const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
   if (isInsideGatekeeperTree(path.resolve(targetPath), gatekeeperRoot)) {
+    if (parsed.rest === "MEMORY.md") {
+      emitDeny(buildMemoryMdDenyContext());
+      process.exit(0);
+    }
     process.exit(0);
   }
 
@@ -792,6 +847,8 @@ export {
   buildDivergentContext,
   buildMemoryMdDenyContext,
   buildEmptyWriteDenyContext,
+  // New export for ticket #14
+  parseGatekeeperTreePath,
 };
 
 // Only run main() when executed directly (not imported as a module).

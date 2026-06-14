@@ -1724,6 +1724,120 @@ test("Regression: Bash delete tombstone write fails → deny still emitted (fail
 });
 
 // ---------------------------------------------------------------------------
+// New E2E tests — ticket #14: MEMORY.md hard-deny inside gatekeeper tree
+// ---------------------------------------------------------------------------
+
+console.log("\n--- New E2E tests (ticket #14): gatekeeper-tree MEMORY.md hard-deny ---");
+
+// 1. KEY REGRESSION TEST: Direct Write to the default gatekeeper MEMORY.md path
+// (no `projects/` segment, no env var) → hard-deny, no file written.
+//
+// Target path: <base>/gatekeeper/<slug>/memory/MEMORY.md
+// parseMemoryPath returns null (no `projects/` segment).
+// Before this fix: hook exits silently (pass-through). After: parseGatekeeperTreePath
+// matches the /gatekeeper/…/memory/MEMORY.md pattern and emits a hard deny.
+test("Regression #14: Write to <base>/gatekeeper/<slug>/memory/MEMORY.md → hard-deny, no file written", () => {
+  const { base, slug } = makeTempBase("slug-gk14-memmd1", "MEMORY.md");
+  const gkMemoryMd = path.join(base, "gatekeeper", slug, "memory", "MEMORY.md");
+
+  const result = runHook(
+    makeWriteEvent(gkMemoryMd, "auto-generated content")
+    // No env var — exercises the default /gatekeeper/ path detection.
+  );
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "permissionDecision is deny");
+
+  // additionalContext must mention MEMORY.md (from buildMemoryMdDenyContext).
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(ctx.includes("MEMORY.md"), "additionalContext includes MEMORY.md");
+
+  // The file must NOT have been written to disk.
+  assert(!fs.existsSync(gkMemoryMd), "MEMORY.md was NOT written to disk");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// 2. Direct Edit to the default gatekeeper MEMORY.md path → hard-deny.
+// Same key scenario as test 1, but using an Edit event.
+test("Regression #14: Edit to <base>/gatekeeper/<slug>/memory/MEMORY.md → hard-deny", () => {
+  const { base, slug } = makeTempBase("slug-gk14-memmd2", "MEMORY.md");
+  const gkMemDir = path.join(base, "gatekeeper", slug, "memory");
+  const gkMemoryMd = path.join(gkMemDir, "MEMORY.md");
+  fs.mkdirSync(gkMemDir, { recursive: true });
+  fs.writeFileSync(gkMemoryMd, "# Memory Index\n- [[NOTE]]\n");
+
+  const result = runHook(
+    makeEditEvent(gkMemoryMd, "NOTE", "OTHER")
+    // No env var — exercises the default /gatekeeper/ path detection.
+  );
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "permissionDecision is deny");
+
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(ctx.includes("MEMORY.md"), "additionalContext includes MEMORY.md");
+
+  // The file on disk must be untouched (no edit applied).
+  assertEqual(
+    fs.readFileSync(gkMemoryMd, "utf8"),
+    "# Memory Index\n- [[NOTE]]\n",
+    "gatekeeper MEMORY.md untouched after deny"
+  );
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// 3. Direct Write to <custom>/<slug>/memory/MEMORY.md with CLAUDE_MEMORY_GATEKEEPER_DIR
+//    set to a custom absolute dir that does NOT enclose the projects tree → hard-deny.
+//
+// parseMemoryPath returns null (path has no `projects/` segment).
+// parseGatekeeperTreePath matches via the env-var branch: path starts with <custom>/
+// and contains <slug>/memory/MEMORY.md.
+test("Regression #14: Write to <custom>/<slug>/memory/MEMORY.md with CLAUDE_MEMORY_GATEKEEPER_DIR=<custom> → hard-deny", () => {
+  // Two separate temp dirs: one for the custom gatekeeper root, one for the
+  // projects tree.  They do NOT share a common parent, so the env-var path is
+  // NOT a parent of the projects tree.
+  const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-custom-"));
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-proj-"));
+  const slug = "slug-gk14-memmd3";
+  const targetPath = path.join(customDir, slug, "memory", "MEMORY.md");
+
+  const result = runHook(
+    makeWriteEvent(targetPath, "auto-generated content"),
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: customDir }
+  );
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "permissionDecision is deny");
+
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(ctx.includes("MEMORY.md"), "additionalContext includes MEMORY.md");
+
+  // The file must NOT have been written to disk.
+  assert(!fs.existsSync(targetPath), "MEMORY.md was NOT written to disk");
+
+  fs.rmSync(customDir, { recursive: true });
+  fs.rmSync(projectsDir, { recursive: true });
+});
+
+// 4. Non-MEMORY.md file in the gatekeeper tree passes through (exit 0, no deny).
+// Verifies the fix does not break pass-through for non-MEMORY.md gatekeeper writes.
+test("Regression #14: Write to <base>/gatekeeper/<slug>/memory/NOTE.md → pass-through (exit 0, no deny)", () => {
+  const { base, slug } = makeTempBase("slug-gk14-passthru", "NOTE.md");
+  const gkNoteMd = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+
+  const result = runHook(makeWriteEvent(gkNoteMd, "some content"));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no deny output for non-MEMORY.md gatekeeper write");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
