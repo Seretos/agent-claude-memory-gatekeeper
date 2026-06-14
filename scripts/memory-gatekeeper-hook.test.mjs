@@ -34,6 +34,9 @@ import {
   buildEmptyWriteDenyContext,
   // New export (ticket #15)
   generateMemoryIndex,
+  // New exports (ticket #16)
+  buildGatekeeperDeleteDenyContext,
+  parseGatekeeperBashCommand,
 } from "./memory-gatekeeper-hook.mjs";
 
 const HOOK_SCRIPT = path.resolve(
@@ -2083,6 +2086,268 @@ test("Fault-tolerance #15: generateMemoryIndex blocked by file-at-MEMORY.md-path
 
   // stderr must mention the generateMemoryIndex error.
   assert(result.stderr.includes("generateMemoryIndex error"), "stderr contains generateMemoryIndex error");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests — ticket #16: buildGatekeeperDeleteDenyContext
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests (ticket #16): buildGatekeeperDeleteDenyContext ---");
+
+test("buildGatekeeperDeleteDenyContext: contains the file path", () => {
+  const filePath = "/some/gatekeeper/slug/memory/NOTE.md";
+  const ctx = buildGatekeeperDeleteDenyContext(filePath);
+  assert(ctx.includes(filePath), "context contains the file path");
+});
+
+test("buildGatekeeperDeleteDenyContext: no forbidden words in prose (path stripped)", () => {
+  const filePath = "/some/gatekeeper/slug/memory/NOTE.md";
+  const ctx = buildGatekeeperDeleteDenyContext(filePath).toLowerCase();
+  // Strip the embedded path — it may contain segments like 'gatekeeper'.
+  const proseOnly = ctx.replace(filePath.toLowerCase(), "");
+  for (const word of ["approval", "pending", "review", "gatekeeper"]) {
+    assert(!proseOnly.includes(word), `buildGatekeeperDeleteDenyContext must not contain '${word}' in prose`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests — ticket #16: parseGatekeeperBashCommand
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests (ticket #16): parseGatekeeperBashCommand ---");
+
+test("parseGatekeeperBashCommand: returns null when no gatekeeper path in command", () => {
+  assertEqual(parseGatekeeperBashCommand("rm -rf /home/user/projects/slug/memory/NOTE.md"), null, "no gatekeeper path");
+});
+
+test("parseGatekeeperBashCommand: returns null for non-string input", () => {
+  assertEqual(parseGatekeeperBashCommand(null), null, "null input");
+  assertEqual(parseGatekeeperBashCommand(undefined), null, "undefined input");
+});
+
+test("parseGatekeeperBashCommand: matches a default-root gatekeeper path", () => {
+  const result = parseGatekeeperBashCommand("rm /base/gatekeeper/my-slug/memory/NOTE.md");
+  assert(result !== null, "should match");
+  assert(result.includes("gatekeeper/my-slug/memory/NOTE.md"), `got: ${result}`);
+});
+
+test("parseGatekeeperBashCommand: matches when command embeds a gatekeeper path mid-string", () => {
+  const result = parseGatekeeperBashCommand("echo before && Remove-Item /some/gatekeeper/proj/memory/FILE.md && echo after");
+  assert(result !== null, "should match mid-string");
+  assert(result.includes("gatekeeper/proj/memory/FILE.md"), `got: ${result}`);
+});
+
+test("parseGatekeeperBashCommand: returns null for command with no path segment at all", () => {
+  assertEqual(parseGatekeeperBashCommand("ls -la /home/user"), null, "no matching path");
+});
+
+test("parseGatekeeperBashCommand: env-var strategy matches custom root path", () => {
+  // On this OS, use an absolute path that does NOT contain 'gatekeeper'.
+  const customRoot = os.platform() === "win32" ? "C:/custom/myroot" : "/custom/myroot";
+  const command = `rm ${customRoot}/my-slug/memory/NOTE.md`;
+  const result = parseGatekeeperBashCommand(command, customRoot);
+  assert(result !== null, "should match via env-var strategy");
+  assert(result.includes("my-slug/memory/NOTE.md"), `got: ${result}`);
+});
+
+test("parseGatekeeperBashCommand: env-var strategy returns null when path does not start with envDir", () => {
+  const customRoot = os.platform() === "win32" ? "C:/custom/myroot" : "/custom/myroot";
+  const command = `rm /other/path/my-slug/memory/NOTE.md`;
+  const result = parseGatekeeperBashCommand(command, customRoot);
+  assertEqual(result, null, "should not match path outside envDir");
+});
+
+// ---------------------------------------------------------------------------
+// E2E regression tests — ticket #16: prevent deletion in the gatekeeper
+// ---------------------------------------------------------------------------
+
+console.log("\n--- E2E regression tests (ticket #16): prevent deletion in gatekeeper ---");
+
+// Helper: make a gatekeeper memory file directly (not via a projects/ path).
+function makeGatekeeperFile(base, slug, filename, content = "existing gatekeeper content") {
+  const gkMemDir = path.join(base, "gatekeeper", slug, "memory");
+  fs.mkdirSync(gkMemDir, { recursive: true });
+  const gkFile = path.join(gkMemDir, filename);
+  fs.writeFileSync(gkFile, content);
+  return gkFile;
+}
+
+// Regression: Bash rm on a gatekeeper-tree path → deny, file NOT deleted.
+test("Regression #16: Bash rm on gatekeeper-tree path → deny, file unchanged", () => {
+  const { base, slug } = makeTempBase("slug-gk16-rm", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md");
+
+  const command = `rm ${gkFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny emitted");
+
+  // File must still exist with its original content.
+  assert(fs.existsSync(gkFile), "gatekeeper file still exists");
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "existing gatekeeper content", "content unchanged");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Regression: Bash Remove-Item on a gatekeeper-tree path → deny, file NOT deleted.
+test("Regression #16: Bash Remove-Item on gatekeeper-tree path → deny, file unchanged", () => {
+  const { base, slug } = makeTempBase("slug-gk16-ri", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md");
+
+  const command = `Remove-Item -Path ${gkFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny emitted");
+
+  assert(fs.existsSync(gkFile), "gatekeeper file still exists after Remove-Item");
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "existing gatekeeper content", "content unchanged");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Regression: Bash rm on gatekeeper-tree path with CLAUDE_MEMORY_GATEKEEPER_DIR env var → deny.
+test("Regression #16: Bash rm on gatekeeper-tree path with CLAUDE_MEMORY_GATEKEEPER_DIR → deny, file unchanged", () => {
+  const customGk = fs.mkdtempSync(path.join(os.tmpdir(), "gk16-custom-"));
+  const slug = "slug-gk16-envvar";
+  const gkMemDir = path.join(customGk, slug, "memory");
+  fs.mkdirSync(gkMemDir, { recursive: true });
+  const gkFile = path.join(gkMemDir, "NOTE.md");
+  fs.writeFileSync(gkFile, "existing content");
+
+  const command = `rm ${gkFile}`;
+  const result = runHook(makeBashEvent(command), { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk });
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny emitted");
+
+  assert(fs.existsSync(gkFile), "gatekeeper file still exists");
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "existing content", "content unchanged");
+
+  fs.rmSync(customGk, { recursive: true });
+});
+
+// Regression: Write empty content to a gatekeeper-tree path (no projects/ segment) → deny, file unchanged.
+test("Regression #16: Write empty content to gatekeeper-tree path → deny, file on disk unchanged", () => {
+  const { base, slug } = makeTempBase("slug-gk16-empty-write", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md");
+
+  const result = runHook(makeWriteEvent(gkFile, ""));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for empty write to gatekeeper-tree path");
+
+  // File must still have original content (not overwritten with empty).
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "existing gatekeeper content", "content unchanged");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Regression: Write empty content via pass-through guard branch (path has projects/ segment AND is inside gatekeeper tree).
+test("Regression #16: Write empty content via pass-through guard (projects/ segment inside gatekeeper tree) → deny", () => {
+  const { base, slug } = makeTempBase("slug-gk16-passthru-empty");
+  // Construct a path that has BOTH 'projects/' AND 'gatekeeper/' — e.g.
+  // <base>/gatekeeper/<slug>/projects/<slug>/memory/NOTE.md
+  // parseMemoryPath will match it AND isInsideGatekeeperTree will be true.
+  const gkRoot = path.join(base, "gatekeeper");
+  const artificialPath = path.join(gkRoot, slug, "projects", slug, "memory", "NOTE.md");
+  fs.mkdirSync(path.dirname(artificialPath), { recursive: true });
+  fs.writeFileSync(artificialPath, "original content");
+
+  const result = runHook(makeWriteEvent(artificialPath, ""));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for empty write via pass-through guard");
+
+  // File must be unchanged.
+  assertEqual(fs.readFileSync(artificialPath, "utf8"), "original content", "file content unchanged");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Regression: Edit with new_string === "" targeting a gatekeeper-tree path → deny.
+test("Regression #16: Edit with new_string='' on gatekeeper-tree path → deny", () => {
+  const { base, slug } = makeTempBase("slug-gk16-edit-wipe", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md", "hello world");
+
+  const result = runHook(makeEditEvent(gkFile, "hello world", ""));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for wiping edit");
+
+  // Content must be unchanged.
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "hello world", "file content unchanged after wiping Edit");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Regression: MultiEdit where one edit has new_string === "" → deny.
+test("Regression #16: MultiEdit with one new_string='' on gatekeeper-tree path → deny", () => {
+  const { base, slug } = makeTempBase("slug-gk16-multiedit-wipe", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md", "hello world");
+
+  const result = runHook(makeMultiEditEvent(gkFile, [
+    { old_string: "hello", new_string: "hi" },
+    { old_string: " world", new_string: "" },
+  ]));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for wiping MultiEdit");
+
+  // Content must be unchanged.
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "hello world", "file content unchanged after wiping MultiEdit");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Non-regression: Write non-empty to gatekeeper-tree path → still passes through.
+test("Non-regression #16: Write non-empty to gatekeeper-tree path → pass-through (exit 0, no deny)", () => {
+  const { base, slug } = makeTempBase("slug-gk16-nonempty-write", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md");
+
+  const result = runHook(makeWriteEvent(gkFile, "new non-empty content"));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no deny for non-empty write to gatekeeper-tree path");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Non-regression: substantive Edit (non-empty new_string) to gatekeeper-tree path → still passes through.
+test("Non-regression #16: substantive Edit to gatekeeper-tree path → pass-through (exit 0, no deny)", () => {
+  const { base, slug } = makeTempBase("slug-gk16-nonempty-edit", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md", "hello world");
+
+  const result = runHook(makeEditEvent(gkFile, "hello", "hi"));
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no deny for substantive Edit to gatekeeper-tree path");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+// Alternate delete verb: unlink on gatekeeper-tree path → deny.
+test("Regression #16 (alternate verb): Bash unlink on gatekeeper-tree path → deny, file unchanged", () => {
+  const { base, slug } = makeTempBase("slug-gk16-unlink", "NOTE.md");
+  const gkFile = makeGatekeeperFile(base, slug, "NOTE.md");
+
+  const command = `unlink ${gkFile}`;
+  const result = runHook(makeBashEvent(command));
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny for unlink");
+
+  assert(fs.existsSync(gkFile), "gatekeeper file still exists after unlink intercept");
+  assertEqual(fs.readFileSync(gkFile, "utf8"), "existing gatekeeper content", "content unchanged");
 
   fs.rmSync(base, { recursive: true });
 });

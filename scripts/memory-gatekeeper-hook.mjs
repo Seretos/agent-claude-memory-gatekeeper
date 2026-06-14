@@ -458,6 +458,20 @@ function buildEmptyWriteDenyContext(gatekeeperPath) {
 }
 
 /**
+ * Build deny context for an attempt to delete or empty a file that is already
+ * inside the submitted memory tree. Contains no forbidden words in prose.
+ *
+ * @param {string} filePath — absolute path to the file targeted for deletion
+ * @returns {string}
+ */
+function buildGatekeeperDeleteDenyContext(filePath) {
+  return (
+    `Submitted memories can only be removed by the user. ` +
+    `The file at ${filePath} has not been modified.`
+  );
+}
+
+/**
  * Emit a PreToolUse deny response to stdout.
  *
  * @param {string} additionalContext — context message for the agent
@@ -529,6 +543,62 @@ function classifyBashIntent(command) {
 }
 
 /**
+ * Regex that matches a path segment of the form:
+ *   gatekeeper/<slug>/memory/<rest>
+ *
+ * Used to intercept delete-intent Bash commands targeting gatekeeper-tree paths
+ * that do NOT contain a `projects/` segment and therefore bypass parseBashCommand.
+ */
+const GATEKEEPER_PATH_RE = /\S*gatekeeper\/[^/\s"';]+\/memory\/\S+/;
+
+/**
+ * Regex that matches any path ending in /<slug>/memory/<rest>.
+ * Used as a broader fallback to detect paths under a custom env-var gatekeeper root
+ * that does not have 'gatekeeper' as a literal segment.
+ */
+const ANY_MEMORY_SUFFIX_RE = /\S+\/[^/\s"';]+\/memory\/\S+/;
+
+/**
+ * Extract the first gatekeeper-tree path found anywhere in a Bash command string.
+ *
+ * Two detection strategies are attempted in priority order:
+ *   1. Default-root pattern: path contains a literal `gatekeeper/` segment.
+ *   2. Env-var-root pattern: path ends in `/<slug>/memory/<rest>` and the
+ *      optional `envDir` is set, absolute, and is a prefix of that path.
+ *
+ * The command is normalised to forward slashes before matching so that Windows
+ * paths are handled correctly. The returned string is in normalised
+ * (forward-slash) form.
+ *
+ * @param {string} command   — the full Bash command string
+ * @param {string} [envDir]  — value of CLAUDE_MEMORY_GATEKEEPER_DIR (may be undefined)
+ * @returns {string|null}    — matched path substring (forward slashes), or null if not found
+ */
+function parseGatekeeperBashCommand(command, envDir) {
+  if (typeof command !== "string") return null;
+  const normalised = command.split(path.sep).join("/");
+
+  // Strategy 1: literal 'gatekeeper/' segment in the path.
+  const gkMatch = normalised.match(GATEKEEPER_PATH_RE);
+  if (gkMatch) return gkMatch[0];
+
+  // Strategy 2: env-var custom root — any /<slug>/memory/<rest> path whose
+  // normalised form starts with the normalised envDir prefix.
+  if (envDir && path.isAbsolute(envDir)) {
+    const normEnvDir = envDir.split(path.sep).join("/").replace(/\/$/, "");
+    const anyMatch = normalised.match(ANY_MEMORY_SUFFIX_RE);
+    if (anyMatch) {
+      const candidate = anyMatch[0];
+      if (candidate.startsWith(normEnvDir + "/") || candidate === normEnvDir) {
+        return candidate;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Build deny context for a Bash command that references a memory path.
  * Contains no approval/pending/review/gatekeeper language.
  *
@@ -581,7 +651,12 @@ function main() {
     const command = typeof toolInput.command === "string" ? toolInput.command : "";
     const detectedPathRel = parseBashCommand(command);
     if (!detectedPathRel) {
-      // No memory path found in the command → pass through.
+      // No memory path (projects/…/memory/…) found. Check for a direct gatekeeper-tree path.
+      const gkDetectedPath = parseGatekeeperBashCommand(command, envDir);
+      if (gkDetectedPath && classifyBashIntent(command) === "delete") {
+        // Block delete-intent against the gatekeeper tree. Leave file intact — no tombstone.
+        emitDeny(buildGatekeeperDeleteDenyContext(gkDetectedPath));
+      }
       process.exit(0);
     }
 
@@ -655,11 +730,38 @@ function main() {
   if (!parsed) {
     // Fallback: check whether the target is a direct write into a gatekeeper tree
     // (path has no `projects/` segment — e.g. <base>/gatekeeper/<slug>/memory/<rest>
-    // or <envDir>/<slug>/memory/<rest>).  MEMORY.md writes must be denied; all
-    // other gatekeeper-tree paths are already in the safe zone → pass through.
+    // or <envDir>/<slug>/memory/<rest>).
     const gkParsed = parseGatekeeperTreePath(targetPath, envDir);
-    if (gkParsed && gkParsed.rest === "MEMORY.md") {
-      emitDeny(buildMemoryMdDenyContext());
+    if (gkParsed) {
+      // MEMORY.md writes must be denied.
+      if (gkParsed.rest === "MEMORY.md") {
+        emitDeny(buildMemoryMdDenyContext());
+        process.exit(0);
+      }
+      // Block empty-Write and content-wiping Edit/MultiEdit against the gatekeeper tree.
+      const resolvedTarget = path.resolve(targetPath);
+      if (toolName === "Write") {
+        const content = typeof toolInput.content === "string" ? toolInput.content : "";
+        if (content === "") {
+          emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+          process.exit(0);
+        }
+      } else if (toolName === "Edit") {
+        const newString = typeof toolInput.new_string === "string" ? toolInput.new_string : "";
+        if (newString === "") {
+          emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+          process.exit(0);
+        }
+      } else if (toolName === "MultiEdit") {
+        const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+        const hasWipingEdit = edits.some(
+          (e) => typeof e.new_string === "string" && e.new_string === ""
+        );
+        if (hasWipingEdit) {
+          emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+          process.exit(0);
+        }
+      }
     }
     process.exit(0);
   }
@@ -676,6 +778,31 @@ function main() {
     if (parsed.rest === "MEMORY.md") {
       emitDeny(buildMemoryMdDenyContext());
       process.exit(0);
+    }
+    // Block destructive ops (empty-Write, content-wiping Edit/MultiEdit) against
+    // gatekeeper-tree files even when the path contains a `projects/` segment.
+    const resolvedTarget = path.resolve(targetPath);
+    if (toolName === "Write") {
+      const content = typeof toolInput.content === "string" ? toolInput.content : "";
+      if (content === "") {
+        emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+        process.exit(0);
+      }
+    } else if (toolName === "Edit") {
+      const newString = typeof toolInput.new_string === "string" ? toolInput.new_string : "";
+      if (newString === "") {
+        emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+        process.exit(0);
+      }
+    } else if (toolName === "MultiEdit") {
+      const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+      const hasWipingEdit = edits.some(
+        (e) => typeof e.new_string === "string" && e.new_string === ""
+      );
+      if (hasWipingEdit) {
+        emitDeny(buildGatekeeperDeleteDenyContext(resolvedTarget));
+        process.exit(0);
+      }
     }
     process.exit(0);
   }
@@ -900,6 +1027,9 @@ export {
   parseGatekeeperTreePath,
   // New export for ticket #15
   generateMemoryIndex,
+  // New exports for ticket #16
+  buildGatekeeperDeleteDenyContext,
+  parseGatekeeperBashCommand,
 };
 
 // Only run main() when executed directly (not imported as a module).
