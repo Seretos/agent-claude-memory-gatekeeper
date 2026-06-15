@@ -73,6 +73,17 @@ The `deny` rules cover both write and delete paths; any `Bash` command matching 
 
 ## Configuration
 
+**`CLAUDE_CONFIG_DIR`** (optional env var)
+
+Claude Code stores its configuration and memory under a canonical root directory. The hook uses this path to determine which writes are targeting live memory and therefore need interception. Any `projects/<slug>/memory/…` path that does **not** sit under the resolved config dir is silently passed through — this prevents false positives from git worktrees or other directories that happen to have a `projects/*/memory` layout.
+
+| Setting | Config dir used |
+|---------|----------------|
+| Unset or relative | `~/.claude` (POSIX) / `%APPDATA%\.claude` (Windows) |
+| Absolute path | `$CLAUDE_CONFIG_DIR` |
+
+You do not normally need to set this variable. Claude Code itself sets `CLAUDE_CONFIG_DIR` when the user has moved the config root. The hook will automatically pick up whatever value Claude Code uses.
+
 **`CLAUDE_MEMORY_GATEKEEPER_DIR`** (optional env var)
 
 Set this to an absolute path to choose a custom gatekeeper root. If unset or a relative path, the default is used.
