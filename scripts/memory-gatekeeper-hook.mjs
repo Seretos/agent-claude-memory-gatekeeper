@@ -31,6 +31,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -50,6 +51,35 @@ function normalisePath(p) {
 }
 
 /**
+ * Resolve Claude Code's canonical configuration directory.
+ *
+ * Resolution order:
+ *   1. $CLAUDE_CONFIG_DIR — if set AND is an absolute path.
+ *   2. Windows fallback: %APPDATA%\.claude (or ~\.claude when APPDATA unset).
+ *   3. POSIX fallback: ~/.claude
+ *
+ * The result is always absolute and normalised with path.resolve() so that
+ * OS-separator differences do not affect downstream comparisons.
+ *
+ * NOTE: This is intentionally a function (not a module-level constant) so
+ * that the value is re-evaluated on every call. Tests inject CLAUDE_CONFIG_DIR
+ * via child-process env or inline process.env overrides; a cached constant
+ * would capture the value at import time and ignore those overrides.
+ *
+ * @returns {string} — absolute path to the canonical config dir
+ */
+function resolveConfigDir() {
+  const envVal = process.env.CLAUDE_CONFIG_DIR;
+  if (envVal && path.isAbsolute(envVal)) {
+    return path.resolve(envVal);
+  }
+  if (process.platform === "win32") {
+    return path.resolve(path.join(process.env.APPDATA || os.homedir(), ".claude"));
+  }
+  return path.resolve(path.join(os.homedir(), ".claude"));
+}
+
+/**
  * Parse a file path for the memory-store pattern.
  *
  * Matches: …/projects/<slug>/memory/<rest>
@@ -57,6 +87,9 @@ function normalisePath(p) {
  *   - Exactly one `<slug>` segment follows.
  *   - Then `memory`.
  *   - Then at least one further segment.
+ *   - The resolved `base` (everything before `projects/`) must equal the
+ *     canonical config dir (resolveConfigDir()).  Paths under unrelated trees
+ *     (e.g. git worktrees) return null and are passed through unchanged.
  *
  * Returns `{ base, slug, rest }` or `null` when the path does not match.
  *
@@ -64,14 +97,23 @@ function normalisePath(p) {
  *           taken verbatim from the original (OS-separator) path.
  * `slug`  — the project slug string.
  * `rest`  — the remainder after `memory/` (forward-slash separated).
+ *
+ * @param {string} filePath   — the target file path
+ * @param {string} [configDir] — canonical config dir (defaults to resolveConfigDir(); injectable for tests)
  */
-function parseMemoryPath(filePath) {
+function parseMemoryPath(filePath, configDir = resolveConfigDir()) {
   const normalised = normalisePath(path.resolve(filePath));
   // Match: <base>/projects/<slug>/memory/<rest>
   const match = normalised.match(/^(.*?)\/projects\/([^/]+)\/memory\/(.+)$/);
   if (!match) return null;
 
   const [, baseNorm, slug, rest] = match;
+
+  // Scope check: the base must be the canonical config dir.
+  // Resolve configDir to an absolute OS path before normalising so that
+  // POSIX-style paths passed inline by tests ("/home/user") are converted
+  // to Windows paths on Windows before the forward-slash comparison.
+  if (baseNorm !== normalisePath(path.resolve(configDir))) return null;
 
   // Recover the original-separator base by taking the same prefix length from
   // the resolved path (resolve() uses OS separators).
@@ -1009,6 +1051,8 @@ export {
   // New exports for ticket #16
   buildGatekeeperDeleteDenyContext,
   parseGatekeeperBashCommand,
+  // New export for ticket #28
+  resolveConfigDir,
 };
 
 // Only run main() when executed directly (not imported as a module).

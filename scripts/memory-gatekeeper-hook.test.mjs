@@ -35,6 +35,8 @@ import {
   // New exports (ticket #16)
   buildGatekeeperDeleteDenyContext,
   parseGatekeeperBashCommand,
+  // New export (ticket #28)
+  resolveConfigDir,
 } from "./memory-gatekeeper-hook.mjs";
 
 const HOOK_SCRIPT = path.resolve(
@@ -221,14 +223,15 @@ test("parseMemoryPath: returns null for projects/<slug>/CLAUDE.md (no memory seg
 });
 
 test("parseMemoryPath: parses a valid memory path", () => {
-  const result = parseMemoryPath("/home/user/projects/my-slug/memory/NOTE.md");
+  // Pass the base (/home/user) as the configDir so the scope check passes.
+  const result = parseMemoryPath("/home/user/projects/my-slug/memory/NOTE.md", "/home/user");
   assert(result !== null, "result should not be null");
   assert(result.slug === "my-slug", `slug should be my-slug, got ${result.slug}`);
   assert(result.rest === "NOTE.md", `rest should be NOTE.md, got ${result.rest}`);
 });
 
 test("parseMemoryPath: preserves nested sub-path in rest", () => {
-  const result = parseMemoryPath("/home/user/projects/my-slug/memory/sub/dir/NOTE.md");
+  const result = parseMemoryPath("/home/user/projects/my-slug/memory/sub/dir/NOTE.md", "/home/user");
   assert(result !== null, "result should not be null");
   assert(result.rest === "sub/dir/NOTE.md", `rest should be sub/dir/NOTE.md, got ${result.rest}`);
 });
@@ -718,7 +721,7 @@ test("Write in-scope → file lands under base/gatekeeper, not under projects/, 
   const { base, slug, memoryDir, liveFile } = makeTempBase("my-slug", "NOTE.md");
   // liveFile = <base>/projects/my-slug/memory/NOTE.md
 
-  const result = runHook(makeWriteEvent(liveFile, "test content"));
+  const result = runHook(makeWriteEvent(liveFile, "test content"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -741,7 +744,7 @@ test("Write in-scope with absolute CLAUDE_MEMORY_GATEKEEPER_DIR → lands under 
 
   const result = runHook(
     makeWriteEvent(liveFile, "custom dir content"),
-    { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk }
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk, CLAUDE_CONFIG_DIR: base }
   );
   assertEqual(result.status, 0, "exit 0");
 
@@ -760,7 +763,7 @@ test("Write in-scope with relative CLAUDE_MEMORY_GATEKEEPER_DIR → falls back t
 
   const result = runHook(
     makeWriteEvent(liveFile, "relative fallback"),
-    { CLAUDE_MEMORY_GATEKEEPER_DIR: "relative/path" }
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: "relative/path", CLAUDE_CONFIG_DIR: base }
   );
   assertEqual(result.status, 0, "exit 0");
 
@@ -775,7 +778,7 @@ test("Write in-scope with empty CLAUDE_MEMORY_GATEKEEPER_DIR → falls back to d
 
   const result = runHook(
     makeWriteEvent(liveFile, "empty fallback"),
-    { CLAUDE_MEMORY_GATEKEEPER_DIR: "" }
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: "", CLAUDE_CONFIG_DIR: base }
   );
   assertEqual(result.status, 0, "exit 0");
 
@@ -788,7 +791,7 @@ test("Write in-scope with empty CLAUDE_MEMORY_GATEKEEPER_DIR → falls back to d
 test("additionalContext names absolute gatekeeper path and prose contains no forbidden words", () => {
   const { base, slug, liveFile } = makeTempBase("proj4", "NOTE.md");
 
-  const result = runHook(makeWriteEvent(liveFile, "ctx test"));
+  const result = runHook(makeWriteEvent(liveFile, "ctx test"), { CLAUDE_CONFIG_DIR: base });
   const out = JSON.parse(result.stdout.trim());
   const ctx = out.hookSpecificOutput.additionalContext;
 
@@ -812,7 +815,7 @@ test("Edit in-scope, only live exists → gatekeeper seeded from live, live unto
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "live original content");
 
-  const result = runHook(makeEditEvent(liveFile));
+  const result = runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -836,7 +839,7 @@ test("Edit in-scope, gatekeeper copy exists and differs from live → divergent 
   fs.mkdirSync(path.dirname(gkPath), { recursive: true });
   fs.writeFileSync(gkPath, "gatekeeper original content");
 
-  const result = runHook(makeEditEvent(liveFile));
+  const result = runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -855,7 +858,7 @@ test("Edit in-scope, neither gatekeeper nor live exists → no output, exit 0", 
   const { base, liveFile } = makeTempBase("slug-edit3", "GHOST.md");
   // Neither gkPath nor liveFile exists.
 
-  const result = runHook(makeEditEvent(liveFile));
+  const result = runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stdout.trim(), "", "no output");
 
@@ -898,7 +901,7 @@ test("Out-of-scope projects/<slug>/CLAUDE.md (no memory segment) → no output, 
 test("Nested sub-path preserved: projects/my-slug/memory/sub/dir/NOTE.md → gatekeeper/my-slug/memory/sub/dir/NOTE.md", () => {
   const { base, slug, liveFile } = makeTempBase("my-slug", "sub/dir/NOTE.md");
 
-  const result = runHook(makeWriteEvent(liveFile, "nested content"));
+  const result = runHook(makeWriteEvent(liveFile, "nested content"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -933,7 +936,7 @@ test("MultiEdit in-scope, only live exists → gatekeeper seeded from live, deny
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "live original content");
 
-  const result = runHook(makeMultiEditEvent(liveFile));
+  const result = runHook(makeMultiEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -954,7 +957,7 @@ test("MultiEdit in-scope, gatekeeper copy exists and differs from live → diver
   fs.mkdirSync(path.dirname(gkPath), { recursive: true });
   fs.writeFileSync(gkPath, "gatekeeper original content");
 
-  const result = runHook(makeMultiEditEvent(liveFile));
+  const result = runHook(makeMultiEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -967,7 +970,7 @@ test("MultiEdit in-scope, gatekeeper copy exists and differs from live → diver
 test("MultiEdit in-scope, neither gatekeeper nor live exists → pass-through", () => {
   const { base, liveFile } = makeTempBase("slug-multiedit3", "GHOST.md");
 
-  const result = runHook(makeMultiEditEvent(liveFile));
+  const result = runHook(makeMultiEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stdout.trim(), "", "no output on pass-through");
 
@@ -996,7 +999,7 @@ test("NotebookEdit in-scope via notebook_path, live exists → deny", () => {
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, '{"cells": []}');
 
-  const result = runHook(makeNotebookEditEvent(liveFile));
+  const result = runHook(makeNotebookEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1011,7 +1014,7 @@ test("NotebookEdit in-scope via notebook_path, live exists → deny", () => {
 test("NotebookEdit in-scope via notebook_path, neither exists → pass-through", () => {
   const { base, liveFile } = makeTempBase("slug-nbedit2", "ghost.ipynb");
 
-  const result = runHook(makeNotebookEditEvent(liveFile));
+  const result = runHook(makeNotebookEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stdout.trim(), "", "no output on pass-through");
 
@@ -1057,7 +1060,7 @@ test("Bash write-intent (cat redirect) → deny, NO gatekeeper file written", ()
   // liveFile = <base>/projects/slug-bash1/memory/NOTE.md
 
   const command = `cat some_file.txt > ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1079,7 +1082,7 @@ test("Bash write-intent additionalContext has no forbidden words", () => {
   fs.mkdirSync(memoryDir, { recursive: true });
 
   const command = `echo hello > ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   const out = JSON.parse(result.stdout.trim());
   const ctx = out.hookSpecificOutput.additionalContext.toLowerCase();
 
@@ -1099,7 +1102,7 @@ test("Bash delete-intent (rm) → deny + zero-byte tombstone created", () => {
   fs.writeFileSync(liveFile, "live content");
 
   const command = `rm ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1118,7 +1121,7 @@ test("Bash delete-intent (Remove-Item) → deny + zero-byte tombstone", () => {
   fs.writeFileSync(liveFile, "live content");
 
   const command = `Remove-Item -Path ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1138,7 +1141,7 @@ test("Bash delete-intent (rm -rf mid-string) → deny + tombstone", () => {
 
   // Memory path appears mid-string (not first token).
   const command = `echo before && rm -rf ${liveFile} && echo after`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1163,7 +1166,7 @@ test("Unknown tool + in-scope path → deny (fail-closed)", () => {
   const result = runHook({
     tool_name: "FutureTool",
     tool_input: { file_path: liveFile },
-  });
+  }, { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1195,7 +1198,7 @@ console.log("\n--- E2E tests: Obsidian bootstrap ---");
 test("E2E Write in-scope → .obsidian bootstrapped at base/gatekeeper", () => {
   const { base, slug, liveFile } = makeTempBase("boot-slug1", "NOTE.md");
 
-  const result = runHook(makeWriteEvent(liveFile, "boot test"));
+  const result = runHook(makeWriteEvent(liveFile, "boot test"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
   assertEqual(result.stderr.trim(), "", "no stderr errors");
 
@@ -1218,7 +1221,7 @@ test("E2E Write with absolute CLAUDE_MEMORY_GATEKEEPER_DIR → .obsidian bootstr
 
   const result = runHook(
     makeWriteEvent(liveFile, "boot custom"),
-    { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk }
+    { CLAUDE_MEMORY_GATEKEEPER_DIR: customGk, CLAUDE_CONFIG_DIR: base }
   );
   assertEqual(result.status, 0, "exit 0");
 
@@ -1239,7 +1242,7 @@ test("E2E Edit seed-and-apply → .obsidian bootstrapped", () => {
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "live content");
 
-  const result = runHook(makeEditEvent(liveFile));
+  const result = runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
@@ -1258,7 +1261,7 @@ test("E2E Edit divergent → .obsidian bootstrapped (idempotent on second call)"
   fs.writeFileSync(gkPath, "gatekeeper content");
 
   // First Edit: divergent, bootstrap fires.
-  runHook(makeEditEvent(liveFile));
+  runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
 
   const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
   assert(fs.existsSync(path.join(obsidianDir, "app.json")), ".obsidian/app.json after first divergent Edit");
@@ -1268,7 +1271,7 @@ test("E2E Edit divergent → .obsidian bootstrapped (idempotent on second call)"
   fs.writeFileSync(sentinel, "keep-me");
 
   // Second Edit: divergent, bootstrap is idempotent.
-  runHook(makeEditEvent(liveFile));
+  runHook(makeEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assert(fs.existsSync(sentinel), "sentinel survives second Edit call");
 
   fs.rmSync(base, { recursive: true });
@@ -1292,7 +1295,7 @@ test("E2E second Write to same root → no re-bootstrap (.obsidian unchanged)", 
   const { base, slug, liveFile } = makeTempBase("boot-slug3", "NOTE.md");
 
   // First Write: bootstrap fires.
-  runHook(makeWriteEvent(liveFile, "first write"));
+  runHook(makeWriteEvent(liveFile, "first write"), { CLAUDE_CONFIG_DIR: base });
 
   const obsidianDir = path.join(base, "gatekeeper", ".obsidian");
   assert(fs.existsSync(path.join(obsidianDir, "app.json")), "app.json after first write");
@@ -1303,7 +1306,7 @@ test("E2E second Write to same root → no re-bootstrap (.obsidian unchanged)", 
 
   // Second Write: bootstrap is a no-op.
   const liveFile2 = path.join(base, "projects", slug, "memory", "NOTE2.md");
-  runHook(makeWriteEvent(liveFile2, "second write"));
+  runHook(makeWriteEvent(liveFile2, "second write"), { CLAUDE_CONFIG_DIR: base });
 
   assert(fs.existsSync(sentinel), "sentinel survives second Write");
   assertEqual(fs.readFileSync(sentinel, "utf8"), "keep-me", "sentinel content unchanged");
@@ -1322,7 +1325,7 @@ test("E2E Write MEMORY.md → hard-deny, no file written to gatekeeper", () => {
   const { base, slug, memoryDir, liveFile } = makeTempBase("slug-memmd1", "MEMORY.md");
   // liveFile ends in MEMORY.md
 
-  const result = runHook(makeWriteEvent(liveFile, "some content"));
+  const result = runHook(makeWriteEvent(liveFile, "some content"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1343,7 +1346,7 @@ test("E2E Edit MEMORY.md → hard-deny", () => {
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "# Memory Index\n- [[NOTE]]\n");
 
-  const result = runHook(makeEditEvent(liveFile, "NOTE", "OTHER"));
+  const result = runHook(makeEditEvent(liveFile, "NOTE", "OTHER"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1362,7 +1365,7 @@ test("E2E Bash rm MEMORY.md → hard-deny, no tombstone", () => {
   fs.writeFileSync(liveFile, "# Memory Index\n");
 
   const command = `rm ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1392,7 +1395,7 @@ test("E2E Write directly to gatekeeper path → pass-through (exit 0, no deny)",
 test("E2E Write empty content → deny, no file written", () => {
   const { base, slug, memoryDir, liveFile } = makeTempBase("slug-empty1", "NOTE.md");
 
-  const result = runHook(makeWriteEvent(liveFile, ""));
+  const result = runHook(makeWriteEvent(liveFile, ""), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1412,7 +1415,7 @@ test("E2E Write empty content → deny, no file written", () => {
 test("E2E Write non-empty → review copy has project: frontmatter", () => {
   const { base, slug, liveFile } = makeTempBase("slug-stamp1", "NOTE.md");
 
-  const result = runHook(makeWriteEvent(liveFile, "# My Note\n\nSome content."));
+  const result = runHook(makeWriteEvent(liveFile, "# My Note\n\nSome content."), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
@@ -1435,7 +1438,7 @@ test("Regression: Edit in-scope, review copy == live → edit applied to review 
   fs.mkdirSync(path.dirname(gkPath), { recursive: true });
   fs.writeFileSync(gkPath, sharedContent);
 
-  const result = runHook(makeEditEvent(liveFile, "world", "there"));
+  const result = runHook(makeEditEvent(liveFile, "world", "there"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1468,7 +1471,7 @@ test("E2E Edit divergent → feedback deny, review copy content unchanged", () =
   fs.mkdirSync(path.dirname(gkPath), { recursive: true });
   fs.writeFileSync(gkPath, "diverged version with edits");
 
-  const result = runHook(makeEditEvent(liveFile, "live", "modified"));
+  const result = runHook(makeEditEvent(liveFile, "live", "modified"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1496,7 +1499,7 @@ test("E2E Edit apply error: old_string not in review copy → graceful fallback"
   fs.writeFileSync(gkPath, sharedContent);
 
   // old_string that does NOT exist in the content.
-  const result = runHook(makeEditEvent(liveFile, "DOES NOT EXIST", "replacement"));
+  const result = runHook(makeEditEvent(liveFile, "DOES NOT EXIST", "replacement"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1521,7 +1524,7 @@ test("E2E Edit apply error: old_string found twice without replace_all → grace
   fs.writeFileSync(gkPath, sharedContent);
 
   // old_string appears twice — should fail gracefully.
-  const result = runHook(makeEditEvent(liveFile, "foo", "qux"));
+  const result = runHook(makeEditEvent(liveFile, "foo", "qux"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1548,7 +1551,7 @@ test("E2E MultiEdit equal case → all edits applied to review copy", () => {
     { old_string: "alpha", new_string: "one" },
     { old_string: "beta", new_string: "two" },
     { old_string: "gamma", new_string: "three" },
-  ]));
+  ]), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1578,7 +1581,7 @@ test("E2E MultiEdit divergent case → feedback, review copy unchanged", () => {
 
   const result = runHook(makeMultiEditEvent(liveFile, [
     { old_string: "alpha", new_string: "beta" },
-  ]));
+  ]), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1596,7 +1599,7 @@ test("E2E Edit seed-and-apply stamps project: frontmatter in seeded copy", () =>
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "hello world\nsome content\n");
 
-  const result = runHook(makeEditEvent(liveFile, "world", "there"));
+  const result = runHook(makeEditEvent(liveFile, "world", "there"), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
@@ -1615,14 +1618,14 @@ test("E2E second Write to same gatekeeper file → project: frontmatter preserve
   const { base, slug, liveFile } = makeTempBase("slug-stamp2", "NOTE.md");
 
   // First write — stamps frontmatter.
-  runHook(makeWriteEvent(liveFile, "# My Note\n\nFirst content."));
+  runHook(makeWriteEvent(liveFile, "# My Note\n\nFirst content."), { CLAUDE_CONFIG_DIR: base });
 
   const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
   const firstContent = fs.readFileSync(gkPath, "utf8");
   assert(firstContent.includes("project:"), "first write has project: frontmatter");
 
   // Second write — should also stamp frontmatter (Write always stamps).
-  runHook(makeWriteEvent(liveFile, "# My Note\n\nUpdated content."));
+  runHook(makeWriteEvent(liveFile, "# My Note\n\nUpdated content."), { CLAUDE_CONFIG_DIR: base });
   const secondContent = fs.readFileSync(gkPath, "utf8");
   assert(secondContent.includes("project:"), "second write preserves project: frontmatter");
 
@@ -1645,7 +1648,7 @@ test("E2E MultiEdit MEMORY.md → hard-deny (auto-generated message), no file wr
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "# Memory Index\n- [[NOTE]]\n");
 
-  const result = runHook(makeMultiEditEvent(liveFile, [{ old_string: "NOTE", new_string: "OTHER" }]));
+  const result = runHook(makeMultiEditEvent(liveFile, [{ old_string: "NOTE", new_string: "OTHER" }]), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1668,7 +1671,7 @@ test("E2E NotebookEdit MEMORY.md → hard-deny (auto-generated message), no file
   fs.mkdirSync(memoryDir, { recursive: true });
   fs.writeFileSync(liveFile, "# Memory Index\n");
 
-  const result = runHook(makeNotebookEditEvent(liveFile));
+  const result = runHook(makeNotebookEditEvent(liveFile), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -1708,7 +1711,7 @@ test("Regression: Bash delete tombstone write fails → deny still emitted (fail
   fs.writeFileSync(gkMemDir, "i am a file, not a directory");
 
   const command = `rm ${liveFile}`;
-  const result = runHook(makeBashEvent(command));
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
   assertEqual(result.status, 0, "exit 0");
 
   // The deny MUST still be emitted even though the tombstone write failed.
@@ -2001,17 +2004,22 @@ test("Regression #16: Write empty content to gatekeeper-tree path → deny, file
 });
 
 // Regression: Write empty content via pass-through guard branch (path has projects/ segment AND is inside gatekeeper tree).
+// The artificial path is <base>/gatekeeper/<slug>/projects/<slug>/memory/NOTE.md.
+// We set CLAUDE_CONFIG_DIR=<base>/gatekeeper/<slug> so parseMemoryPath matches it
+// (base == configDir) AND isInsideGatekeeperTree detects it is inside the gatekeeper tree.
 test("Regression #16: Write empty content via pass-through guard (projects/ segment inside gatekeeper tree) → deny", () => {
   const { base, slug } = makeTempBase("slug-gk16-passthru-empty");
   // Construct a path that has BOTH 'projects/' AND 'gatekeeper/' — e.g.
   // <base>/gatekeeper/<slug>/projects/<slug>/memory/NOTE.md
-  // parseMemoryPath will match it AND isInsideGatekeeperTree will be true.
+  // With CLAUDE_CONFIG_DIR=<base>/gatekeeper/<slug>, parseMemoryPath will match it
+  // AND isInsideGatekeeperTree will be true, exercising the pass-through guard branch.
   const gkRoot = path.join(base, "gatekeeper");
-  const artificialPath = path.join(gkRoot, slug, "projects", slug, "memory", "NOTE.md");
+  const configDirForTest = path.join(gkRoot, slug);
+  const artificialPath = path.join(configDirForTest, "projects", slug, "memory", "NOTE.md");
   fs.mkdirSync(path.dirname(artificialPath), { recursive: true });
   fs.writeFileSync(artificialPath, "original content");
 
-  const result = runHook(makeWriteEvent(artificialPath, ""));
+  const result = runHook(makeWriteEvent(artificialPath, ""), { CLAUDE_CONFIG_DIR: configDirForTest });
   assertEqual(result.status, 0, "exit 0");
 
   const out = JSON.parse(result.stdout.trim());
@@ -2240,6 +2248,199 @@ test("deriveProjectName: git unavailable → falls back to basename, does not th
   } finally {
     fs.rmSync(plainDir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// New unit tests — ticket #28: resolveConfigDir and parseMemoryPath scope check
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Unit tests (ticket #28): resolveConfigDir ---");
+
+test("resolveConfigDir: respects absolute CLAUDE_CONFIG_DIR", () => {
+  const customDir = os.platform() === "win32" ? "C:\\custom\\claude" : "/custom/claude";
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.CLAUDE_CONFIG_DIR = customDir;
+    const result = resolveConfigDir();
+    assertEqual(result, path.resolve(customDir), "returns resolved CLAUDE_CONFIG_DIR when set to absolute path");
+  } finally {
+    if (saved === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+  }
+});
+
+test("resolveConfigDir: ignores relative CLAUDE_CONFIG_DIR and falls back to platform default", () => {
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.CLAUDE_CONFIG_DIR = "relative/path";
+    const result = resolveConfigDir();
+    // Must be an absolute path (the platform default).
+    assert(path.isAbsolute(result), `result must be absolute, got: ${result}`);
+    // Must end with .claude
+    assert(result.endsWith(".claude") || result.endsWith("\\.claude") || result.endsWith("/.claude"),
+      `result must end with .claude, got: ${result}`);
+    // Must NOT contain the relative override.
+    assert(!result.includes("relative"), "result must not contain the relative override");
+  } finally {
+    if (saved === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+  }
+});
+
+test("resolveConfigDir: returns platform default when CLAUDE_CONFIG_DIR is absent", () => {
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    const result = resolveConfigDir();
+    assert(path.isAbsolute(result), `result must be absolute, got: ${result}`);
+    assert(result.endsWith(".claude") || result.endsWith("\\.claude") || result.endsWith("/.claude"),
+      `result must end with .claude, got: ${result}`);
+  } finally {
+    if (saved === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+  }
+});
+
+test("resolveConfigDir: on Windows falls back to APPDATA/.claude", () => {
+  // Only meaningful on Windows; on POSIX we just verify the return is absolute and ends with .claude.
+  if (os.platform() === "win32") {
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      delete process.env.CLAUDE_CONFIG_DIR;
+      const result = resolveConfigDir();
+      const expectedBase = process.env.APPDATA || os.homedir();
+      assertEqual(result, path.resolve(path.join(expectedBase, ".claude")),
+        "Windows: falls back to APPDATA/.claude");
+    } finally {
+      if (saved === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = saved;
+      }
+    }
+  } else {
+    // POSIX: verify result is homedir/.claude
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      delete process.env.CLAUDE_CONFIG_DIR;
+      const result = resolveConfigDir();
+      assertEqual(result, path.resolve(path.join(os.homedir(), ".claude")),
+        "POSIX: falls back to homedir/.claude");
+    } finally {
+      if (saved === undefined) {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      } else {
+        process.env.CLAUDE_CONFIG_DIR = saved;
+      }
+    }
+  }
+});
+
+console.log("\n--- Unit tests (ticket #28): parseMemoryPath scope check ---");
+
+test("parseMemoryPath: returns null when base does not match canonical config dir", () => {
+  // A structurally valid memory path but under a different base (e.g., a worktree).
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-28-wt-"));
+  const filePath = path.join(worktreeDir, "projects", "my-slug", "memory", "NOTE.md");
+  try {
+    // Do NOT set CLAUDE_CONFIG_DIR — resolveConfigDir() returns the real ~/.claude.
+    // The worktreeDir is definitely not ~/.claude, so parseMemoryPath must return null.
+    const result = parseMemoryPath(filePath);
+    assertEqual(result, null, "path under worktree dir (not configDir) must return null");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("parseMemoryPath: returns non-null when base equals the injected configDir", () => {
+  const tmpBase = fs.realpathSync(os.tmpdir());
+  const fakeConfigDir = fs.mkdtempSync(path.join(tmpBase, "mem-gk-28-cfg-"));
+  const filePath = path.join(fakeConfigDir, "projects", "my-slug", "memory", "NOTE.md");
+  try {
+    const result = parseMemoryPath(filePath, fakeConfigDir);
+    assert(result !== null, "path under injected configDir must not return null");
+    assert(result.slug === "my-slug", `slug should be my-slug, got ${result.slug}`);
+    assert(result.rest === "NOTE.md", `rest should be NOTE.md, got ${result.rest}`);
+  } finally {
+    fs.rmSync(fakeConfigDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// New E2E regression tests — ticket #28: false-positive worktree trigger fix
+// ---------------------------------------------------------------------------
+
+console.log("\n--- E2E regression tests (ticket #28): no false-positive for worktree paths ---");
+
+// Regression test (the reported bug): a temp dir that is NOT ~/.claude and NOT
+// CLAUDE_CONFIG_DIR, with a projects/<slug>/memory/NOTE.md structure, sent as a
+// Write event WITHOUT setting CLAUDE_CONFIG_DIR → expect exit 0, no stdout (pass-through).
+test("Regression #28: Write to worktree-relative projects/<slug>/memory/NOTE.md without CLAUDE_CONFIG_DIR → pass-through", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-28-wt-"));
+  const memoryDir = path.join(worktreeDir, "projects", "my-slug", "memory");
+  const liveFile = path.join(memoryDir, "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "worktree content");
+
+  try {
+    // Explicitly clear CLAUDE_CONFIG_DIR so the hook uses the real ~/.claude default.
+    // The path is under a temp worktree dir, not under ~/.claude, so it must pass through.
+    const result = runHook(makeWriteEvent(liveFile, "new content"), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output — worktree path passes through");
+    // The live file must NOT have been redirected (hook did nothing, Claude Code
+    // would normally write liveFile itself, but the hook exits without touching it).
+    // The gatekeeper tree must not have been created at the worktree base.
+    const gkPath = path.join(worktreeDir, "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(!fs.existsSync(gkPath), "no gatekeeper file created for worktree path");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+// Same scenario for a Bash write-intent command: the command references a memory
+// path under a worktree dir (not ~/.claude), so must pass through.
+test("Regression #28: Bash write-intent with worktree projects/<slug>/memory/NOTE.md without CLAUDE_CONFIG_DIR → pass-through", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-28-bash-"));
+  const liveFile = path.join(worktreeDir, "projects", "my-slug", "memory", "NOTE.md");
+
+  try {
+    const command = `cat some_file.txt > ${liveFile}`;
+    const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output for Bash with worktree path");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+// Canonical path (CLAUDE_CONFIG_DIR set to the temp base) IS in-scope → deny.
+// This confirms the fix does not break legitimate interception.
+test("Regression #28 (non-regression): Write to canonical-config-dir projects/<slug>/memory/NOTE.md → deny as before", () => {
+  const { base, slug, liveFile } = makeTempBase("slug-28-canonical", "NOTE.md");
+
+  const result = runHook(makeWriteEvent(liveFile, "canonical content"), { CLAUDE_CONFIG_DIR: base });
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "canonical path still triggers deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(fs.existsSync(gkPath), "gatekeeper file created for canonical path");
+
+  fs.rmSync(base, { recursive: true });
 });
 
 // ---------------------------------------------------------------------------
