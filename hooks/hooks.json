@@ -1,0 +1,17 @@
+{
+  "description": "Intercepts Write, Edit, MultiEdit, NotebookEdit, and Bash calls targeting Claude Code's memory store and redirects them into a configurable gatekeeper tree for manual human promotion.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/memory-gatekeeper-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
