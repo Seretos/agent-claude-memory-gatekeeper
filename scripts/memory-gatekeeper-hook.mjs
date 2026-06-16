@@ -528,15 +528,18 @@ function emitDeny(additionalContext) {
 /**
  * Regex that matches a full path ending in the memory-store pattern.
  *
- * Uses a \S* prefix to capture any non-whitespace path prefix (e.g. an
- * absolute path on any platform) before the `projects/` segment.
- * The `rest` stops at the first whitespace character.
+ * Both the prefix and the trailing `rest` exclude shell quote/terminator
+ * characters (`"`, `'`, `;`) as well as whitespace. This keeps surrounding
+ * shell quoting out of the captured path: a command like
+ * `rm "…/projects/<slug>/memory/foo.md"` yields the bare path, not one with
+ * a leading/trailing `"`. A captured quote would otherwise make
+ * `path.resolve` treat the path as relative and break tombstone creation.
  *
  * NOTE: Regex literals cannot include an unescaped `/` inside a character
  * class in all engines/parsers, so this regex is forward-slash-only.
  * `parseBashCommand` normalises the command to forward slashes before matching.
  */
-const MEMORY_PATH_RE = /\S*projects\/[^/\s"';]+\/memory\/\S+/;
+const MEMORY_PATH_RE = /[^\s"';]*projects\/[^/\s"';]+\/memory\/[^\s"';]+/;
 
 /**
  * Extract the first memory path found anywhere in a Bash command string.
@@ -557,11 +560,32 @@ function parseBashCommand(command) {
 }
 
 /**
- * DELETE_INTENT_RE matches delete verbs as whole words (case-insensitive).
- * Covered: rm, del, Remove-Item, unlink, truncate, Clear-Content.
+ * DELETE_INTENT_RE matches delete verbs only in *command position* — at the
+ * start of the command or immediately after a shell separator
+ * (`;`, `&`, `|`, `(`, `{`, `}` or a newline), with an optional `sudo` prefix.
+ * Covered verbs: rm, del, Remove-Item, unlink, truncate, Clear-Content.
+ *
+ * Anchoring to command position prevents false positives where a delete verb
+ * appears as prose inside an argument — e.g. `echo "cleaned up via rm" > …` or
+ * `ls "…/nach rm/…"` must NOT be classified as a deletion.
  */
 const DELETE_INTENT_RE =
-  /\b(rm|del|Remove-Item|unlink|truncate|Clear-Content)\b/i;
+  /(?:^|[\n;&|(){}])\s*(?:sudo\s+)?(?:rm|del|Remove-Item|unlink|truncate|Clear-Content)\b/i;
+
+/**
+ * READ_INTENT_RE matches recognised read-only commands in command position.
+ * The set is deliberately small and side-effect-free; tools that can write or
+ * delete in place (sed -i, awk, find -delete/-exec, vim, tee, dd) are excluded.
+ */
+const READ_INTENT_RE =
+  /(?:^|[\n;&|(){}])\s*(?:sudo\s+)?(?:cat|bat|less|more|head|tail|ls|dir|stat|wc|file|nl|tac|od|xxd|hexdump|type|grep|egrep|fgrep|rg|Get-Content|gc|Get-ChildItem|gci|Get-Item)\b/i;
+
+/**
+ * WRITE_REDIRECT_RE matches output-redirection / writer tokens that would
+ * disqualify a command from being treated as a pure read — the memory path
+ * could be a redirect target. Conservative: any `>` anywhere disqualifies.
+ */
+const WRITE_REDIRECT_RE = /(?:>|\btee\b|\bdd\b)/i;
 
 /**
  * Classify the intent of a Bash command that references a memory path.
@@ -575,20 +599,41 @@ function classifyBashIntent(command) {
 }
 
 /**
+ * Determine whether a Bash command that references a memory path is a *pure
+ * read* — a recognised read-only verb in command position, with no output
+ * redirection and no delete verb anywhere. Such commands neither write nor
+ * delete the memory file and are therefore safe to pass through.
+ *
+ * Fail-closed: anything that does not clearly qualify returns false, so the
+ * caller falls back to the write/delete deny path.
+ *
+ * @param {string} command — the full Bash command string
+ * @returns {boolean}
+ */
+function isBashReadOnly(command) {
+  if (typeof command !== "string") return false;
+  // A delete verb anywhere → not a pure read (delete handling takes precedence).
+  if (DELETE_INTENT_RE.test(command)) return false;
+  // Any redirection / writer token → the memory path might be written.
+  if (WRITE_REDIRECT_RE.test(command)) return false;
+  return READ_INTENT_RE.test(command);
+}
+
+/**
  * Regex that matches a path segment of the form:
  *   gatekeeper/<slug>/memory/<rest>
  *
  * Used to intercept delete-intent Bash commands targeting gatekeeper-tree paths
  * that do NOT contain a `projects/` segment and therefore bypass parseBashCommand.
  */
-const GATEKEEPER_PATH_RE = /\S*gatekeeper\/[^/\s"';]+\/memory\/\S+/;
+const GATEKEEPER_PATH_RE = /[^\s"';]*gatekeeper\/[^/\s"';]+\/memory\/[^\s"';]+/;
 
 /**
  * Regex that matches any path ending in /<slug>/memory/<rest>.
  * Used as a broader fallback to detect paths under a custom env-var gatekeeper root
  * that does not have 'gatekeeper' as a literal segment.
  */
-const ANY_MEMORY_SUFFIX_RE = /\S+\/[^/\s"';]+\/memory\/\S+/;
+const ANY_MEMORY_SUFFIX_RE = /[^\s"';]+\/[^/\s"';]+\/memory\/[^\s"';]+/;
 
 /**
  * Extract the first gatekeeper-tree path found anywhere in a Bash command string.
@@ -631,25 +676,46 @@ function parseGatekeeperBashCommand(command, envDir) {
 }
 
 /**
- * Build deny context for a Bash command that references a memory path.
- * Contains no approval/pending/review/gatekeeper language.
+ * Build deny context for a write-intent Bash command that references a memory
+ * path. Contains no approval/pending/review/gatekeeper language.
  *
  * @param {string} detectedPath — the memory path extracted from the command
- * @param {"delete"|"write"} intent — the classified intent
+ * @param {"delete"|"write"} [intent] — retained for signature stability; unused
  * @returns {string}
  */
 function buildBashDenyContext(detectedPath, intent) {
-  if (intent === "delete") {
-    return (
-      `Memory deletions via Bash are intercepted. ` +
-      `A deletion marker has been recorded for: ${detectedPath}. ` +
-      `No further action is needed.`
-    );
-  }
-  // write intent
   return (
     `Memory writes via Bash are not permitted. ` +
     `Use the Write tool to write to the detected memory path: ${detectedPath}`
+  );
+}
+
+/**
+ * Build deny context for a delete-intent Bash command. The message is coupled
+ * to whether the zero-byte tombstone was actually written — it must never claim
+ * a marker was recorded when the write failed.
+ *
+ * Contains no approval/pending/review/gatekeeper language in prose (the staged
+ * path passed in may itself contain a `gatekeeper` path segment — that is data,
+ * not prose).
+ *
+ * @param {string} detectedPath    — the live memory path extracted from the command
+ * @param {string} stagedPath      — the gatekeeper path where the tombstone was (to be) written
+ * @param {boolean} tombstoneWritten — whether the tombstone write succeeded
+ * @returns {string}
+ */
+function buildBashDeleteContext(detectedPath, stagedPath, tombstoneWritten) {
+  if (tombstoneWritten) {
+    return (
+      `Memory deletions via Bash are intercepted. ` +
+      `A deletion marker for ${detectedPath} has been recorded at ${stagedPath}. ` +
+      `No further action is needed.`
+    );
+  }
+  return (
+    `Memory deletions via Bash are intercepted and the command was blocked. ` +
+    `No deletion marker could be recorded for ${detectedPath}. ` +
+    `To record the deletion, use the Write tool to create an empty file at ${stagedPath}.`
   );
 }
 
@@ -706,7 +772,14 @@ function main() {
       process.exit(0);
     }
 
-    // Hard-deny MEMORY.md in Bash path.
+    // Pure read-only commands (cat/ls/grep/head/… with no redirection) neither
+    // write nor delete the memory file — pass them through so the agent can
+    // inspect memory (and MEMORY.md) via Bash.
+    if (isBashReadOnly(command)) {
+      process.exit(0);
+    }
+
+    // Hard-deny MEMORY.md in Bash path (writes/deletes only — reads handled above).
     if (parsed.rest === "MEMORY.md") {
       emitDeny(buildMemoryMdDenyContext());
       process.exit(0);
@@ -715,15 +788,18 @@ function main() {
     const intent = classifyBashIntent(command);
     const gatekeeperPath = resolveGatekeeperPath(parsed, envDir);
     const gatekeeperDir = path.dirname(gatekeeperPath);
-    const additionalContext = buildBashDenyContext(detectedPathRel, intent);
 
     if (intent === "delete") {
       // Seed a zero-byte tombstone in the gatekeeper tree.
       // The deny is emitted unconditionally below — even when the tombstone
       // write fails — so the destructive command is never allowed through.
+      // The message is coupled to `tombstoneWritten`: it must not claim a
+      // marker was recorded when the write actually failed.
+      let tombstoneWritten = false;
       try {
         fs.mkdirSync(gatekeeperDir, { recursive: true });
         fs.writeFileSync(gatekeeperPath, "");
+        tombstoneWritten = true;
         const gatekeeperRoot = resolveGatekeeperRoot(parsed, envDir);
         bootstrapObsidian(gatekeeperRoot, parsed.base);
       } catch (err) {
@@ -731,11 +807,12 @@ function main() {
           `memory-gatekeeper-hook: tombstone write failed: ${err instanceof Error ? err.message : String(err)}\n`
         );
       }
+      emitDeny(buildBashDeleteContext(detectedPathRel, gatekeeperPath, tombstoneWritten));
+      process.exit(0);
     }
-    // write-intent: hard deny, no gatekeeper file written.
-    // deny is ALWAYS emitted regardless of tombstone outcome.
 
-    emitDeny(additionalContext);
+    // write-intent: hard deny, no gatekeeper file written.
+    emitDeny(buildBashDenyContext(detectedPathRel, intent));
     process.exit(0);
   }
 
@@ -1036,7 +1113,9 @@ export {
   bootstrapObsidian,
   parseBashCommand,
   classifyBashIntent,
+  isBashReadOnly,
   buildBashDenyContext,
+  buildBashDeleteContext,
   // New exports for ticket #6
   isInsideGatekeeperTree,
   deriveProjectName,

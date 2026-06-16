@@ -24,9 +24,9 @@ The `PreToolUse` hook fires on all five write-capable tool calls:
 | `Edit` | Gatekeeper copy seeded from the live file (if absent), then deny. |
 | `MultiEdit` | Same as `Edit`. |
 | `NotebookEdit` | Same as `Edit` (uses `notebook_path` field). |
-| `Bash` | Command scanned for a memory path anywhere in the string. Write-intent: hard deny, no file written. Delete-intent (`rm`, `del`, `Remove-Item`, `unlink`, `truncate`, `Clear-Content`): zero-byte **tombstone** seeded in the gatekeeper tree + deny. |
+| `Bash` | Command scanned for a memory path anywhere in the string. **Read-only** (`cat`, `ls`, `grep`, `head`, `tail`, … in command position, no redirection): passed through. **Delete-intent** (`rm`, `del`, `Remove-Item`, `unlink`, `truncate`, `Clear-Content` in command position): zero-byte **tombstone** seeded in the gatekeeper tree + deny. **Otherwise** (write-intent): hard deny, no file written. Delete/read verbs are only recognised in command position (start of command or after `;` `&` `|` `(` `{`), so a verb appearing as prose inside an argument does not trigger them. |
 
-**Delete tombstones.** A zero-byte file at a gatekeeper path is the signal that the agent wanted to delete that memory. The apply/accept tool (#6) reads tombstones as delete instructions.
+**Delete tombstones.** A zero-byte file at a gatekeeper path is the signal that the agent wanted to delete that memory. The apply/accept tool (#6) reads tombstones as delete instructions. The tombstone deny message only reports a marker as recorded when the file was actually written; if the write fails, the message says so and the command is still blocked.
 
 **Fail-closed.** Any tool name not listed above that carries an in-scope memory path is also denied. Unknown tools are treated as write attempts.
 
