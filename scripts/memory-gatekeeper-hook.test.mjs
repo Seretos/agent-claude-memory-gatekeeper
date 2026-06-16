@@ -22,7 +22,9 @@ import {
   bootstrapObsidian,
   parseBashCommand,
   classifyBashIntent,
+  isBashReadOnly,
   buildBashDenyContext,
+  buildBashDeleteContext,
   // New exports (ticket #6)
   isInsideGatekeeperTree,
   deriveProjectName,
@@ -472,6 +474,26 @@ test("parseBashCommand: returns null for projects/<slug>/CLAUDE.md (no memory se
   assertEqual(result, null, "no memory segment");
 });
 
+test("parseBashCommand: double-quoted path → quotes excluded from match (ticket #32)", () => {
+  const result = parseBashCommand('rm "/base/projects/my-slug/memory/NOTE.md"');
+  assert(result !== null, "should match inside double quotes");
+  assert(!result.includes('"'), `match must not contain a quote; got: ${result}`);
+  assertEqual(result, "/base/projects/my-slug/memory/NOTE.md", "bare path only");
+});
+
+test("parseBashCommand: single-quoted path → quotes excluded from match (ticket #32)", () => {
+  const result = parseBashCommand("rm '/base/projects/my-slug/memory/NOTE.md'");
+  assert(result !== null, "should match inside single quotes");
+  assert(!result.includes("'"), `match must not contain a quote; got: ${result}`);
+  assertEqual(result, "/base/projects/my-slug/memory/NOTE.md", "bare path only");
+});
+
+test("parseBashCommand: trailing shell tokens excluded from match (ticket #32)", () => {
+  // A semicolon-terminated command must not pull `;` and following chars in.
+  const result = parseBashCommand("rm /base/projects/my-slug/memory/NOTE.md; echo done");
+  assertEqual(result, "/base/projects/my-slug/memory/NOTE.md", "stops at ';'");
+});
+
 console.log("\n--- Unit tests: classifyBashIntent ---");
 
 test("classifyBashIntent: rm → delete", () => {
@@ -518,12 +540,67 @@ test("classifyBashIntent: cp → write", () => {
   assertEqual(classifyBashIntent("cp file.txt projects/slug/memory/NOTE.md"), "write", "cp");
 });
 
-console.log("\n--- Unit tests: buildBashDenyContext ---");
-
-test("buildBashDenyContext: delete intent contains detected path", () => {
-  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "delete");
-  assert(ctx.includes("projects/slug/memory/NOTE.md"), "contains path");
+test("classifyBashIntent: delete verb after '&&' separator → delete (ticket #32)", () => {
+  assertEqual(
+    classifyBashIntent("echo before && rm projects/slug/memory/NOTE.md"),
+    "delete",
+    "rm after &&"
+  );
 });
+
+test("classifyBashIntent: 'rm' as prose in an echo string → NOT delete (ticket #32)", () => {
+  // The word 'rm' appears mid-argument, not in command position.
+  assertEqual(
+    classifyBashIntent('echo "cleanup done, removed via rm" ; ls projects/slug/memory/NOTE.md'),
+    "write",
+    "prose 'rm' must not classify as delete"
+  );
+});
+
+test("classifyBashIntent: 'del' inside a word/path → NOT delete (ticket #32)", () => {
+  assertEqual(
+    classifyBashIntent("ls projects/slug/memory/old-model-notes.md"),
+    "write",
+    "'del' substring is not a command-position verb"
+  );
+});
+
+console.log("\n--- Unit tests: isBashReadOnly (ticket #32 / nebenbefund #3) ---");
+
+test("isBashReadOnly: cat <mem> → true", () => {
+  assert(isBashReadOnly("cat projects/slug/memory/NOTE.md"), "cat is read-only");
+});
+
+test("isBashReadOnly: ls -la <mem> → true", () => {
+  assert(isBashReadOnly("ls -la projects/slug/memory/"), "ls is read-only");
+});
+
+test("isBashReadOnly: grep/head/tail → true", () => {
+  assert(isBashReadOnly("grep foo projects/slug/memory/NOTE.md"), "grep");
+  assert(isBashReadOnly("head -n 5 projects/slug/memory/NOTE.md"), "head");
+  assert(isBashReadOnly("tail -n 5 projects/slug/memory/NOTE.md"), "tail");
+});
+
+test("isBashReadOnly: read verb but redirect to memory path → false", () => {
+  assert(!isBashReadOnly("cat other.txt > projects/slug/memory/NOTE.md"), "redirect disqualifies");
+});
+
+test("isBashReadOnly: read verb but delete verb present → false", () => {
+  assert(!isBashReadOnly("cat projects/slug/memory/NOTE.md && rm projects/slug/memory/NOTE.md"), "delete present");
+});
+
+test("isBashReadOnly: tee writer token → false", () => {
+  assert(!isBashReadOnly("echo x | tee projects/slug/memory/NOTE.md"), "tee writes");
+});
+
+test("isBashReadOnly: unknown / non-read verb → false (fail-closed)", () => {
+  assert(!isBashReadOnly("python edit.py projects/slug/memory/NOTE.md"), "unknown verb");
+  assert(!isBashReadOnly("vim projects/slug/memory/NOTE.md"), "vim can write");
+  assert(!isBashReadOnly("non-string"), "string with no read verb");
+  assert(!isBashReadOnly(null), "null input");
+});
+
+console.log("\n--- Unit tests: buildBashDenyContext ---");
 
 test("buildBashDenyContext: write intent mentions Write tool and detected path", () => {
   const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "write");
@@ -531,20 +608,49 @@ test("buildBashDenyContext: write intent mentions Write tool and detected path",
   assert(ctx.includes("Write"), "mentions Write tool");
 });
 
-test("buildBashDenyContext: delete intent has no forbidden words", () => {
-  const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "delete").toLowerCase();
-  // Strip the embedded path first (may contain segments like 'memory').
-  const proseOnly = ctx.replace("projects/slug/memory/note.md", "");
-  for (const word of ["approval", "pending", "review", "gatekeeper"]) {
-    assert(!proseOnly.includes(word), `delete context must not contain '${word}'`);
-  }
-});
-
 test("buildBashDenyContext: write intent has no forbidden words", () => {
   const ctx = buildBashDenyContext("projects/slug/memory/NOTE.md", "write").toLowerCase();
   const proseOnly = ctx.replace("projects/slug/memory/note.md", "");
   for (const word of ["approval", "pending", "review", "gatekeeper"]) {
     assert(!proseOnly.includes(word), `write context must not contain '${word}'`);
+  }
+});
+
+console.log("\n--- Unit tests: buildBashDeleteContext ---");
+
+const GK_STAGED = "/base/gatekeeper/slug/memory/NOTE.md";
+
+test("buildBashDeleteContext: success contains both paths and 'recorded'", () => {
+  const ctx = buildBashDeleteContext("projects/slug/memory/NOTE.md", GK_STAGED, true);
+  assert(ctx.includes("projects/slug/memory/NOTE.md"), "contains detected path");
+  assert(ctx.includes(GK_STAGED), "contains staged path");
+  assert(/recorded/i.test(ctx), "states the marker was recorded");
+  assert(/no further action/i.test(ctx), "states no further action needed");
+});
+
+test("buildBashDeleteContext: failure does NOT claim a marker was recorded", () => {
+  const ctx = buildBashDeleteContext("projects/slug/memory/NOTE.md", GK_STAGED, false);
+  assert(ctx.includes("projects/slug/memory/NOTE.md"), "contains detected path");
+  assert(ctx.includes(GK_STAGED), "contains staged path");
+  assert(!/no further action/i.test(ctx), "must not say no further action on failure");
+  assert(
+    /no deletion marker could be recorded/i.test(ctx),
+    "states the marker was NOT recorded"
+  );
+});
+
+test("buildBashDeleteContext: no forbidden words in prose (success + failure)", () => {
+  for (const written of [true, false]) {
+    const ctx = buildBashDeleteContext("projects/slug/memory/NOTE.md", GK_STAGED, written)
+      .toLowerCase();
+    // Strip both embedded paths first (they contain segments like 'memory'
+    // and 'gatekeeper' that are data, not prose).
+    const proseOnly = ctx
+      .replace("projects/slug/memory/note.md", "")
+      .replace(GK_STAGED.toLowerCase(), "");
+    for (const word of ["approval", "pending", "review", "gatekeeper"]) {
+      assert(!proseOnly.includes(word), `delete context (written=${written}) must not contain '${word}'`);
+    }
   }
 });
 
@@ -1054,6 +1160,31 @@ test("Bash: no memory path in command → pass-through, exit 0", () => {
   assertEqual(result.stdout.trim(), "", "no output");
 });
 
+test("Bash read-only (cat <mem>) → pass-through, no deny (ticket #32 / nebenbefund #3)", () => {
+  const { base, memoryDir, liveFile } = makeTempBase("slug-bash-read", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  const result = runHook(makeBashEvent(`cat ${liveFile}`), { CLAUDE_CONFIG_DIR: base });
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "no deny output — read passes through");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash read-only (cat MEMORY.md) → pass-through, no deny (ticket #32 / nebenbefund #3)", () => {
+  const { base, memoryDir } = makeTempBase("slug-bash-read2", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  const memIndex = path.join(memoryDir, "MEMORY.md");
+  fs.writeFileSync(memIndex, "# Memory Index\n");
+
+  const result = runHook(makeBashEvent(`cat ${memIndex}`), { CLAUDE_CONFIG_DIR: base });
+  assertEqual(result.status, 0, "exit 0");
+  assertEqual(result.stdout.trim(), "", "reading MEMORY.md passes through");
+
+  fs.rmSync(base, { recursive: true });
+});
+
 test("Bash write-intent (cat redirect) → deny, NO gatekeeper file written", () => {
   const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash1", "NOTE.md");
   fs.mkdirSync(memoryDir, { recursive: true });
@@ -1150,6 +1281,31 @@ test("Bash delete-intent (rm -rf mid-string) → deny + tombstone", () => {
   const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
   assert(fs.existsSync(gkPath), "tombstone created for mid-string rm");
   assertEqual(fs.readFileSync(gkPath).length, 0, "tombstone is zero-byte");
+
+  fs.rmSync(base, { recursive: true });
+});
+
+test("Bash delete-intent (rm with QUOTED path) → deny + real tombstone (ticket #32)", () => {
+  const { base, slug, memoryDir, liveFile } = makeTempBase("slug-bash-quoted", "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "live content");
+
+  // Quoted path is the normal shell form — it previously broke tombstone
+  // creation because the surrounding quotes were captured into the path.
+  const command = `rm "${liveFile}"`;
+  const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: base });
+  assertEqual(result.status, 0, "exit 0");
+
+  const out = JSON.parse(result.stdout.trim());
+  assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny");
+
+  const gkPath = path.join(base, "gatekeeper", slug, "memory", "NOTE.md");
+  assert(fs.existsSync(gkPath), "tombstone created for quoted rm");
+  assertEqual(fs.readFileSync(gkPath).length, 0, "tombstone is zero-byte");
+
+  // The message must claim success only because the marker truly exists.
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(/recorded/i.test(ctx), "message states the marker was recorded");
 
   fs.rmSync(base, { recursive: true });
 });
@@ -1717,6 +1873,12 @@ test("Regression: Bash delete tombstone write fails → deny still emitted (fail
   // The deny MUST still be emitted even though the tombstone write failed.
   const out = JSON.parse(result.stdout.trim());
   assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny still emitted when tombstone write fails");
+
+  // The message MUST NOT claim a marker was recorded when the write failed
+  // (ticket #32 — the message is coupled to the actual outcome).
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert(!/no further action/i.test(ctx), "message must not say 'no further action' on failed write");
+  assert(/no deletion marker could be recorded/i.test(ctx), "message states the marker was NOT recorded");
 
   // The gatekeeper file should NOT exist (write failed, and we didn't
   // accidentally overwrite the file we planted).
