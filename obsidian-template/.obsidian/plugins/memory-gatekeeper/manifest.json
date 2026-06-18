@@ -1,0 +1,9 @@
+{
+  "id": "memory-gatekeeper",
+  "name": "Memory Gatekeeper",
+  "version": "0.0.5",
+  "minAppVersion": "1.4.0",
+  "description": "Reviews proposed memory changes by diffing the vault (gatekeeper) against a real memory folder, marks divergent files in the explorer and graph, and lets you accept or dismiss each change.",
+  "author": "Arne von Appen",
+  "isDesktopOnly": true
+}
