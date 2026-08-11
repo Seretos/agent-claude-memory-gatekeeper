@@ -1,0 +1,15 @@
+# Claude Code silently ignores CRLF-encoded instruction/settings files.
+# eol=lf overrides a client's core.autocrlf, so this fix travels with the
+# repo instead of depending on per-machine git config.
+* text=auto eol=lf
+
+# Load-bearing: the files Claude Code parses.
+.claude/**  text eol=lf
+CLAUDE.md   text eol=lf
+AGENTS.md   text eol=lf
+
+# Binaries: never line-ending-convert. Belt-and-braces over the
+# text=auto content heuristic.
+*.png binary
+*.zip binary
+*.ico binary

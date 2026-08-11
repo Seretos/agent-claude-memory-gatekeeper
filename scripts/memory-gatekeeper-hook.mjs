@@ -51,12 +51,37 @@ function normalisePath(p) {
 }
 
 /**
+ * Check whether `p` exists and is a directory.
+ *
+ * Returns `false` on any error (ENOENT, EPERM on a locked roaming profile,
+ * etc.) rather than throwing — a stray *file* named `.claude` (or an
+ * inaccessible path) must never be treated as an existing config dir.
+ *
+ * @param {string} p
+ * @returns {boolean}
+ */
+function isExistingDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolve Claude Code's canonical configuration directory.
  *
  * Resolution order:
- *   1. $CLAUDE_CONFIG_DIR — if set AND is an absolute path.
- *   2. Windows fallback: %APPDATA%\.claude (or ~\.claude when APPDATA unset).
- *   3. POSIX fallback: ~/.claude
+ *   1. $CLAUDE_CONFIG_DIR — if set AND is an absolute path. Returned
+ *      verbatim, existence-UNgated: an explicitly configured root that does
+ *      not exist yet is still authoritative.
+ *   2. The first of the following that EXISTS as a directory:
+ *        a. <home>/.claude
+ *        b. <APPDATA>/.claude — Windows only, when $APPDATA is set.
+ *      A non-existent directory never wins over an existing one, and a
+ *      stray *file* (not a directory) at a candidate path does not count.
+ *   3. Otherwise (neither candidate exists): <home>/.claude — the fixed
+ *      default on every platform, including Windows.
  *
  * The result is always absolute and normalised with path.resolve() so that
  * OS-separator differences do not affect downstream comparisons.
@@ -66,17 +91,90 @@ function normalisePath(p) {
  * via child-process env or inline process.env overrides; a cached constant
  * would capture the value at import time and ignore those overrides.
  *
+ * The `options` object is an injectable seam for tests: `process.platform`
+ * cannot be faked inside a spawned child process, so without this seam the
+ * Windows resolution order would be unprovable on a POSIX CI runner. Mirrors
+ * the `parseMemoryPath(filePath, configDir = resolveConfigDir())`
+ * "injectable for tests" precedent below. The zero-arg call sites used in
+ * production are unaffected.
+ *
+ * @param {object} [options]
+ * @param {NodeJS.ProcessEnv} [options.env] — env source (default process.env)
+ * @param {string} [options.platform] — process.platform override (default process.platform)
+ * @param {string} [options.homeDir] — os.homedir() override (default os.homedir())
+ * @param {(p: string) => boolean} [options.exists] — directory-existence probe (default isExistingDir)
  * @returns {string} — absolute path to the canonical config dir
  */
-function resolveConfigDir() {
-  const envVal = process.env.CLAUDE_CONFIG_DIR;
+function resolveConfigDir({
+  env = process.env,
+  platform = process.platform,
+  homeDir = os.homedir(),
+  exists = isExistingDir,
+} = {}) {
+  const envVal = env.CLAUDE_CONFIG_DIR;
   if (envVal && path.isAbsolute(envVal)) {
     return path.resolve(envVal);
   }
-  if (process.platform === "win32") {
-    return path.resolve(path.join(process.env.APPDATA || os.homedir(), ".claude"));
+
+  const candidates = [path.join(homeDir, ".claude")];
+  if (platform === "win32" && env.APPDATA) {
+    candidates.push(path.join(env.APPDATA, ".claude"));
   }
-  return path.resolve(path.join(os.homedir(), ".claude"));
+
+  for (const candidate of candidates) {
+    let candidateExists = false;
+    try {
+      candidateExists = exists(candidate);
+    } catch {
+      // An injected exists() that throws is treated as non-existent — must
+      // never crash the hook.
+      candidateExists = false;
+    }
+    if (candidateExists) return path.resolve(candidate);
+  }
+
+  // Neither candidate exists (or none was applicable) — fixed default.
+  return path.resolve(candidates[0]);
+}
+
+/**
+ * Matches the shape `<base>/projects/<slug>/memory/<rest>` against a
+ * normalised (forward-slash) path string. Hoisted to a module-level const so
+ * `parseMemoryPath` (the scope check) and `isMemoryShapedPath` (the
+ * diagnostic-shape check) share exactly one pattern and cannot drift.
+ */
+const MEMORY_PATH_SHAPE_RE = /^(.*?)\/projects\/([^/]+)\/memory\/(.+)$/;
+
+/**
+ * Resolve `p` to its canonical on-disk real path, tolerating directory
+ * junctions, symlinks, and other filesystem-level aliasing/redirection.
+ *
+ * Guarded: any failure (ENOENT for a non-existent path, EPERM, etc.) returns
+ * `p` unchanged rather than throwing. This is deliberate on both counts — a
+ * non-existent path must never crash the hook, AND it must never become
+ * "equal" to some other unresolved path just because both throws collapsed
+ * to the same unresolved string; two candidates that legitimately differ as
+ * strings and both fail to resolve are still correctly treated as different.
+ *
+ * Prefers `fs.realpathSync.native` (avoids Node's JS-side realpath cache)
+ * where available, falling back to `fs.realpathSync`.
+ *
+ * This is the production default for `parseMemoryPath`'s injectable
+ * `realpath` seam (see below) — mirrors the `exists` seam already injectable
+ * on `resolveConfigDir`.
+ *
+ * @param {string} p
+ * @returns {string}
+ */
+function resolveRealPath(p) {
+  try {
+    const impl = typeof fs.realpathSync.native === "function"
+      ? fs.realpathSync.native
+      : fs.realpathSync;
+    return impl(p);
+  } catch {
+    return p;
+  }
 }
 
 /**
@@ -91,6 +189,23 @@ function resolveConfigDir() {
  *     canonical config dir (resolveConfigDir()).  Paths under unrelated trees
  *     (e.g. git worktrees) return null and are passed through unchanged.
  *
+ * Scope check (two-tier, ticket #37 fix cycle):
+ *   1. FAST PATH — exact normalised-string comparison of `base` against the
+ *      canonical config dir. Decides every case it decided before this fix,
+ *      with identical results; pure string comparison, no filesystem access.
+ *   2. FALLBACK — only when the fast path fails: resolve both `base` and the
+ *      config dir through the guarded `realpath` seam and compare the
+ *      canonicalised forms. This rescues the case where `resolveConfigDir()`
+ *      deterministically prefers one spelling (e.g. `~/.claude`) while the
+ *      write is addressed via a different spelling (e.g. `%APPDATA%\.claude`)
+ *      that is a true on-disk ALIAS of it (a directory junction, a
+ *      symlinked/redirected profile) — without this, such a write would
+ *      compare unequal and silently pass through uninterceped, the same
+ *      failure class ticket #37 exists to eliminate. Filesystem access only
+ *      happens on this rejection path; the common in-scope case above stays
+ *      a pure string comparison. Case-insensitivity is deliberately NOT part
+ *      of this fallback — only true realpath-resolved aliasing counts.
+ *
  * Returns `{ base, slug, rest }` or `null` when the path does not match.
  *
  * `base`  — absolute path up to (not including) the `projects/` segment,
@@ -100,27 +215,37 @@ function resolveConfigDir() {
  *
  * @param {string} filePath   — the target file path
  * @param {string} [configDir] — canonical config dir (defaults to resolveConfigDir(); injectable for tests)
+ * @param {(p: string) => string} [realpath] — real-path resolver (defaults to resolveRealPath; injectable for tests)
  */
-function parseMemoryPath(filePath, configDir = resolveConfigDir()) {
+function parseMemoryPath(filePath, configDir = resolveConfigDir(), realpath = resolveRealPath) {
   const normalised = normalisePath(path.resolve(filePath));
   // Match: <base>/projects/<slug>/memory/<rest>
-  const match = normalised.match(/^(.*?)\/projects\/([^/]+)\/memory\/(.+)$/);
+  const match = normalised.match(MEMORY_PATH_SHAPE_RE);
   if (!match) return null;
 
   const [, baseNorm, slug, rest] = match;
-
-  // Scope check: the base must be the canonical config dir.
-  // Resolve configDir to an absolute OS path before normalising so that
-  // POSIX-style paths passed inline by tests ("/home/user") are converted
-  // to Windows paths on Windows before the forward-slash comparison.
-  if (baseNorm !== normalisePath(path.resolve(configDir))) return null;
 
   // Recover the original-separator base by taking the same prefix length from
   // the resolved path (resolve() uses OS separators).
   const resolved = path.resolve(filePath);
   const base = resolved.slice(0, baseNorm.length);
 
-  return { base, slug, rest };
+  const resolvedConfigDir = path.resolve(configDir);
+
+  // Fast path: exact normalised-string comparison (unchanged behaviour).
+  if (baseNorm === normalisePath(resolvedConfigDir)) {
+    return { base, slug, rest };
+  }
+
+  // Fallback: alias-tolerant comparison via realpath. Filesystem access only
+  // happens here, on the rejection path.
+  const canonicalBase = normalisePath(realpath(base));
+  const canonicalConfigDir = normalisePath(realpath(resolvedConfigDir));
+  if (canonicalBase === canonicalConfigDir) {
+    return { base, slug, rest };
+  }
+
+  return null;
 }
 
 /**
@@ -521,6 +646,49 @@ function emitDeny(additionalContext) {
   process.stdout.write(JSON.stringify(output) + "\n");
 }
 
+/**
+ * Determine whether `filePath` has the shape of a memory-store path
+ * (…/projects/<slug>/memory/<rest>), independent of whether its base
+ * matches the canonical config dir.
+ *
+ * Used only to decide whether a scope mismatch is worth a stderr diagnostic
+ * (ticket #37): a path with this shape that `parseMemoryPath` rejected is
+ * almost certainly a real memory write landing on the wrong config dir, not
+ * an unrelated tree that happens to contain `projects/*\/memory`.
+ * Gatekeeper-tree paths have no `projects/` segment and are false by
+ * construction, so they never trigger noise.
+ *
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isMemoryShapedPath(filePath) {
+  const normalised = normalisePath(path.resolve(filePath));
+  return MEMORY_PATH_SHAPE_RE.test(normalised);
+}
+
+/**
+ * Build the single stderr diagnostic line for a memory-shaped path that was
+ * rejected by `parseMemoryPath`'s scope check (its base does not equal the
+ * canonical config dir). Points at `CLAUDE_CONFIG_DIR` as the remedy so the
+ * silent-pass-through failure mode (ticket #37) is never silent again.
+ *
+ * @param {string} filePath  — the rejected target path
+ * @param {string} configDir — the resolved canonical config dir used for the check
+ * @returns {string} — a single line ending in "\n"
+ */
+function buildScopeMismatchDiagnostic(filePath, configDir) {
+  const resolved = path.resolve(filePath);
+  const normalised = normalisePath(resolved);
+  const match = normalised.match(MEMORY_PATH_SHAPE_RE);
+  const base = match ? resolved.slice(0, match[1].length) : path.dirname(resolved);
+  const resolvedConfigDir = path.resolve(configDir);
+  return (
+    `memory-gatekeeper-hook: memory-shaped path rejected — base "${base}" does not match ` +
+    `the canonical config dir "${resolvedConfigDir}". If this is intentional, set ` +
+    `CLAUDE_CONFIG_DIR to the correct root.\n`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Bash-specific helpers (exported for tests)
 // ---------------------------------------------------------------------------
@@ -768,7 +936,14 @@ function main() {
     // parseMemoryPath does a suffix match.
     const parsed = parseMemoryPath(path.resolve(detectedPathRel));
     if (!parsed) {
-      // Unparseable → pass through (fault-tolerant).
+      // Unparseable → pass through (fault-tolerant). If the path is
+      // memory-shaped (ticket #37 — a rejected config-dir scope match, not
+      // an unrelated tree), surface exactly one stderr diagnostic so the
+      // failure is never silent.
+      const resolvedDetected = path.resolve(detectedPathRel);
+      if (isMemoryShapedPath(resolvedDetected)) {
+        process.stderr.write(buildScopeMismatchDiagnostic(resolvedDetected, resolveConfigDir()));
+      }
       process.exit(0);
     }
 
@@ -870,6 +1045,12 @@ function main() {
           process.exit(0);
         }
       }
+    }
+    // Memory-shaped path that the gatekeeper-tree fallback did not already
+    // handle (ticket #37): surface exactly one stderr diagnostic so a scope
+    // mismatch against the resolved config dir is never silent.
+    if (!gkParsed && isMemoryShapedPath(targetPath)) {
+      process.stderr.write(buildScopeMismatchDiagnostic(targetPath, resolveConfigDir()));
     }
     process.exit(0);
   }
@@ -1132,6 +1313,12 @@ export {
   parseGatekeeperBashCommand,
   // New export for ticket #28
   resolveConfigDir,
+  // New exports for ticket #37
+  isExistingDir,
+  isMemoryShapedPath,
+  buildScopeMismatchDiagnostic,
+  // New export for ticket #37 fix cycle (alias-tolerant scope comparison)
+  resolveRealPath,
 };
 
 // Only run main() when executed directly (not imported as a module).

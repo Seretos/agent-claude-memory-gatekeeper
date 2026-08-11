@@ -79,10 +79,12 @@ Claude Code stores its configuration and memory under a canonical root directory
 
 | Setting | Config dir used |
 |---------|----------------|
-| Unset or relative | `~/.claude` (POSIX) / `%APPDATA%\.claude` (Windows) |
-| Absolute path | `$CLAUDE_CONFIG_DIR` |
+| Unset or relative | Whichever of `~/.claude` or (Windows-only) `%APPDATA%\.claude` actually **exists** on disk, `~/.claude` preferred when both do. If neither exists yet, `~/.claude` is the default on every platform, including Windows. |
+| Absolute path | `$CLAUDE_CONFIG_DIR` (used verbatim, even if that path does not exist yet) |
 
 You do not normally need to set this variable. Claude Code itself sets `CLAUDE_CONFIG_DIR` when the user has moved the config root. The hook will automatically pick up whatever value Claude Code uses.
+
+**Silent-mismatch diagnostic.** If a write targets a path shaped like a memory store (`…/projects/<slug>/memory/…`) but its base does not match the resolved config dir, the hook still passes the write through unchanged — but now also prints one line to stderr naming the rejected path's base and the resolved config dir, so a config-dir mismatch is never silent. Set `CLAUDE_CONFIG_DIR` explicitly if you see this diagnostic and expected interception.
 
 **`CLAUDE_MEMORY_GATEKEEPER_DIR`** (optional env var)
 
