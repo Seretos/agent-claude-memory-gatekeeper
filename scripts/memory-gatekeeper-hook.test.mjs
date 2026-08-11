@@ -39,6 +39,10 @@ import {
   parseGatekeeperBashCommand,
   // New export (ticket #28)
   resolveConfigDir,
+  // New exports (ticket #37)
+  isExistingDir,
+  isMemoryShapedPath,
+  buildScopeMismatchDiagnostic,
 } from "./memory-gatekeeper-hook.mjs";
 
 const HOOK_SCRIPT = path.resolve(
@@ -2472,16 +2476,34 @@ test("resolveConfigDir: returns platform default when CLAUDE_CONFIG_DIR is absen
   }
 });
 
-test("resolveConfigDir: on Windows falls back to APPDATA/.claude", () => {
-  // Only meaningful on Windows; on POSIX we just verify the return is absolute and ends with .claude.
+test("resolveConfigDir #37: on Windows prefers an existing ~/.claude over %APPDATA%\\.claude", () => {
+  // Only meaningful on Windows; on POSIX we just verify the (unchanged) homedir/.claude fallback.
   if (os.platform() === "win32") {
     const saved = process.env.CLAUDE_CONFIG_DIR;
     try {
       delete process.env.CLAUDE_CONFIG_DIR;
+      const realHomeClaudeExists = (() => {
+        try {
+          return fs.statSync(path.join(os.homedir(), ".claude")).isDirectory();
+        } catch {
+          return false;
+        }
+      })();
       const result = resolveConfigDir();
-      const expectedBase = process.env.APPDATA || os.homedir();
-      assertEqual(result, path.resolve(path.join(expectedBase, ".claude")),
-        "Windows: falls back to APPDATA/.claude");
+      if (realHomeClaudeExists) {
+        // Ticket #37's reported bug: with a real ~/.claude present (as on any
+        // machine that has actually run Claude Code), the hook must resolve
+        // to it — not to %APPDATA%\.claude, which typically does not exist.
+        assertEqual(result, path.resolve(path.join(os.homedir(), ".claude")),
+          "Windows: an existing ~/.claude must win over %APPDATA%\\.claude");
+      } else {
+        // No real ~/.claude on this machine — the deterministic injected
+        // scenarios are covered separately below (R1-R3); here just assert
+        // the general invariants still hold.
+        assert(path.isAbsolute(result), `result must be absolute, got: ${result}`);
+        assert(result.endsWith(".claude") || result.endsWith("\\.claude") || result.endsWith("/.claude"),
+          `result must end with .claude, got: ${result}`);
+      }
     } finally {
       if (saved === undefined) {
         delete process.env.CLAUDE_CONFIG_DIR;
@@ -2490,7 +2512,7 @@ test("resolveConfigDir: on Windows falls back to APPDATA/.claude", () => {
       }
     }
   } else {
-    // POSIX: verify result is homedir/.claude
+    // POSIX: verify result is homedir/.claude (unaffected by ticket #37).
     const saved = process.env.CLAUDE_CONFIG_DIR;
     try {
       delete process.env.CLAUDE_CONFIG_DIR;
@@ -2503,6 +2525,232 @@ test("resolveConfigDir: on Windows falls back to APPDATA/.claude", () => {
       } else {
         process.env.CLAUDE_CONFIG_DIR = saved;
       }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// New tests — ticket #37: existence-based resolveConfigDir() resolution
+// ---------------------------------------------------------------------------
+
+console.log("\n--- New tests (ticket #37): resolveConfigDir existence-based resolution ---");
+
+test("Regression #37: win32 with existing ~/.claude and missing %APPDATA%\\.claude → memory path is in scope", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-appdata-"));
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  // fakeAppData/.claude intentionally NOT created — reproduces the reported bug.
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeHome, ".claude"),
+      "existing ~/.claude must win over missing %APPDATA%\\.claude");
+
+    const liveFile = path.join(fakeHome, ".claude", "projects", "my-slug", "memory", "NOTE.md");
+    const parsed = parseMemoryPath(liveFile, cfg);
+    assert(parsed !== null, "memory path under existing ~/.claude must be in scope");
+    assertEqual(parsed.slug, "my-slug", "slug parsed correctly");
+    assertEqual(parsed.rest, "NOTE.md", "rest parsed correctly");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("Regression #37 (E2E, win32 only): Write into ~/.claude memory store emits deny", () => {
+  if (os.platform() !== "win32") {
+    console.log("        (skipped — win32-only E2E, running on " + os.platform() + ")");
+    return;
+  }
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-e2e-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-e2e-appdata-"));
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+
+  const liveFile = path.join(fakeHome, ".claude", "projects", "my-slug", "memory", "NOTE.md");
+
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "new content"), {
+      CLAUDE_CONFIG_DIR: "",
+      USERPROFILE: fakeHome,
+      HOME: fakeHome,
+      APPDATA: fakeAppData,
+    });
+    assertEqual(result.status, 0, "exit 0");
+    const out = JSON.parse(result.stdout.trim());
+    assertEqual(out.hookSpecificOutput.permissionDecision, "deny",
+      "memory write under real ~/.claude must be denied");
+
+    const gkPath = path.join(fakeHome, ".claude", "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(fs.existsSync(gkPath), "gatekeeper file staged");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("Regression #37 (E2E Bash, win32 only): rm on ~/.claude memory store emits deny with tombstone", () => {
+  if (os.platform() !== "win32") {
+    console.log("        (skipped — win32-only E2E, running on " + os.platform() + ")");
+    return;
+  }
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-e2ebash-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-e2ebash-appdata-"));
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+
+  const liveFile = path.join(fakeHome, ".claude", "projects", "my-slug", "memory", "NOTE.md");
+
+  try {
+    const result = runHook(makeBashEvent(`rm ${liveFile}`), {
+      CLAUDE_CONFIG_DIR: "",
+      USERPROFILE: fakeHome,
+      HOME: fakeHome,
+      APPDATA: fakeAppData,
+    });
+    assertEqual(result.status, 0, "exit 0");
+    const out = JSON.parse(result.stdout.trim());
+    assertEqual(out.hookSpecificOutput.permissionDecision, "deny",
+      "Bash rm on real ~/.claude memory path must be denied");
+
+    const gkPath = path.join(fakeHome, ".claude", "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(fs.existsSync(gkPath), "tombstone staged");
+    assertEqual(fs.readFileSync(gkPath, "utf8"), "", "tombstone is zero-byte");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: win32 falls back to existing %APPDATA%\\.claude when ~/.claude is absent", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r2-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r2-appdata-"));
+  fs.mkdirSync(path.join(fakeAppData, ".claude"), { recursive: true });
+  // fakeHome/.claude intentionally absent.
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeAppData, ".claude"), "falls back to existing %APPDATA%\\.claude");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: win32 — both ~/.claude and %APPDATA%\\.claude exist → ~/.claude wins", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r2b-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r2b-appdata-"));
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  fs.mkdirSync(path.join(fakeAppData, ".claude"), { recursive: true });
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeHome, ".claude"), "~/.claude wins when both exist");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: win32 with APPDATA unset and ~/.claude absent → ~/.claude default", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r2c-home-"));
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: {} });
+    assertEqual(cfg, path.resolve(fakeHome, ".claude"), "defaults to ~/.claude when APPDATA unset");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: win32 defaults to ~/.claude when neither candidate exists", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3-appdata-"));
+  // Neither fakeHome/.claude nor fakeAppData/.claude exists.
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeHome, ".claude"), "defaults to ~/.claude when neither candidate exists");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: POSIX unaffected by an existing APPDATA/.claude", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3b-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3b-appdata-"));
+  fs.mkdirSync(path.join(fakeAppData, ".claude"), { recursive: true });
+  // fakeHome/.claude intentionally absent.
+
+  try {
+    const cfg = resolveConfigDir({ platform: "linux", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeHome, ".claude"), "POSIX ignores APPDATA entirely, even when it exists");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: a FILE (not a dir) named .claude never wins — APPDATA dir wins instead", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const fakeHome = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3c-home-"));
+  const fakeAppData = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37-r3c-appdata-"));
+  fs.writeFileSync(path.join(fakeHome, ".claude"), "not a directory");
+  fs.mkdirSync(path.join(fakeAppData, ".claude"), { recursive: true });
+
+  try {
+    const cfg = resolveConfigDir({ platform: "win32", homeDir: fakeHome, env: { APPDATA: fakeAppData } });
+    assertEqual(cfg, path.resolve(fakeAppData, ".claude"),
+      "a stray file must not win over an existing directory candidate");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+    fs.rmSync(fakeAppData, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfigDir #37: an injected exists() that throws is treated as non-existent, no crash", () => {
+  const fakeHome = path.join("C:", "fake", "home", "for", "throw", "test");
+  let threw = false;
+  let cfg;
+  try {
+    cfg = resolveConfigDir({
+      platform: "win32",
+      homeDir: fakeHome,
+      env: { APPDATA: path.join("C:", "fake", "appdata") },
+      exists: () => {
+        throw new Error("boom");
+      },
+    });
+  } catch {
+    threw = true;
+  }
+  assert(!threw, "resolveConfigDir must not crash when the exists probe throws");
+  assertEqual(cfg, path.resolve(fakeHome, ".claude"),
+    "falls back to ~/.claude default when exists() throws for every candidate");
+});
+
+test("resolveConfigDir #37: absolute CLAUDE_CONFIG_DIR pointing at a non-existent path is still returned verbatim", () => {
+  const nonExistent = os.platform() === "win32"
+    ? "C:\\definitely\\not\\real\\claude-cfg"
+    : "/definitely/not/real/claude-cfg";
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.CLAUDE_CONFIG_DIR = nonExistent;
+    const result = resolveConfigDir();
+    assertEqual(result, path.resolve(nonExistent),
+      "explicit CLAUDE_CONFIG_DIR wins even when the directory does not exist yet");
+  } finally {
+    if (saved === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = saved;
     }
   }
 });
@@ -2603,6 +2851,365 @@ test("Regression #28 (non-regression): Write to canonical-config-dir projects/<s
   assert(fs.existsSync(gkPath), "gatekeeper file created for canonical path");
 
   fs.rmSync(base, { recursive: true });
+});
+
+// ---------------------------------------------------------------------------
+// New tests — ticket #37: scope-mismatch stderr diagnostic
+// ---------------------------------------------------------------------------
+
+console.log("\n--- New tests (ticket #37): scope-mismatch stderr diagnostic ---");
+
+test("Diagnostic #37: memory-shaped out-of-scope Write path emits exactly one stderr line, stdout stays empty", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-37-diag-"));
+  const memoryDir = path.join(worktreeDir, "projects", "my-slug", "memory");
+  const liveFile = path.join(memoryDir, "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "worktree content");
+
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "new content"), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output — still pass-through");
+    const gkPath = path.join(worktreeDir, "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(!fs.existsSync(gkPath), "no gatekeeper file created");
+    assert(result.stderr.includes("memory-gatekeeper-hook:"), "stderr carries the diagnostic prefix");
+    assert(result.stderr.includes(worktreeDir), "stderr names the rejected path's base");
+    const lines = result.stderr.trim().split("\n");
+    assertEqual(lines.length, 1, "exactly one stderr line");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("Diagnostic #37: non-memory-shaped out-of-scope path produces NO stderr", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-37-diagnoise-"));
+  const notesDir = path.join(worktreeDir, "projects", "my-slug", "notes");
+  const liveFile = path.join(notesDir, "NOTE.md");
+  fs.mkdirSync(notesDir, { recursive: true });
+  fs.writeFileSync(liveFile, "notes content");
+
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "new content"), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output");
+    assertEqual(result.stderr.trim(), "", "no stderr — path has no /memory/ segment");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("Diagnostic #37: path with no projects/ segment at all produces NO stderr", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-37-diagnoise2-"));
+  const liveFile = path.join(worktreeDir, "some", "other", "file.md");
+  fs.mkdirSync(path.dirname(liveFile), { recursive: true });
+  fs.writeFileSync(liveFile, "other content");
+
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "new content"), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output");
+    assertEqual(result.stderr.trim(), "", "no stderr — path has no projects/…/memory/ shape at all");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("Diagnostic #37: Bash write-intent with out-of-scope memory path emits the same single stderr line", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-37-diagbash-"));
+  const liveFile = path.join(worktreeDir, "projects", "my-slug", "memory", "NOTE.md");
+
+  try {
+    const command = `cat some_file.txt > ${liveFile}`;
+    const result = runHook(makeBashEvent(command), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output");
+    assert(result.stderr.includes("memory-gatekeeper-hook:"), "stderr carries the diagnostic prefix");
+    const lines = result.stderr.trim().split("\n");
+    assertEqual(lines.length, 1, "exactly one stderr line");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("Diagnostic #37: in-scope write emits NO diagnostic", () => {
+  const { base, liveFile } = makeTempBase("slug-37-inscope", "NOTE.md");
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "in scope content"), { CLAUDE_CONFIG_DIR: base });
+    assertEqual(result.stderr.trim(), "", "no diagnostic for in-scope write");
+    const out = JSON.parse(result.stdout.trim());
+    assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny still appears on stdout");
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+console.log("\n--- Unit tests (ticket #37): isMemoryShapedPath / buildScopeMismatchDiagnostic / isExistingDir ---");
+
+test("isMemoryShapedPath: true for …/projects/x/memory/y.md", () => {
+  const p = path.join(os.tmpdir(), "base", "projects", "x", "memory", "y.md");
+  assertEqual(isMemoryShapedPath(p), true, "simple memory path is shaped");
+});
+
+test("isMemoryShapedPath: true for nested …/memory/a/b.md", () => {
+  const p = path.join(os.tmpdir(), "base", "projects", "x", "memory", "a", "b.md");
+  assertEqual(isMemoryShapedPath(p), true, "nested memory path is shaped");
+});
+
+test("isMemoryShapedPath: false for …/projects/x/notes/y.md", () => {
+  const p = path.join(os.tmpdir(), "base", "projects", "x", "notes", "y.md");
+  assertEqual(isMemoryShapedPath(p), false, "notes path is not memory-shaped");
+});
+
+test("isMemoryShapedPath: false for …/projects/x/memory (no rest)", () => {
+  const p = path.join(os.tmpdir(), "base", "projects", "x", "memory");
+  assertEqual(isMemoryShapedPath(p), false, "bare memory dir with no rest is not shaped");
+});
+
+test("isMemoryShapedPath: false for a gatekeeper-tree path", () => {
+  const p = path.join(os.tmpdir(), "base", "gatekeeper", "x", "memory", "y.md");
+  assertEqual(isMemoryShapedPath(p), false, "gatekeeper-tree path has no projects/ segment");
+});
+
+test("isMemoryShapedPath: false for empty string", () => {
+  assertEqual(isMemoryShapedPath(""), false, "empty string is not shaped");
+});
+
+test("buildScopeMismatchDiagnostic: single line, prefixed, names both base and config dir", () => {
+  const filePath = path.join(os.tmpdir(), "worktree", "projects", "x", "memory", "y.md");
+  const configDir = path.join(os.tmpdir(), "home", ".claude");
+  const line = buildScopeMismatchDiagnostic(filePath, configDir);
+  assert(line.startsWith("memory-gatekeeper-hook:"), "starts with the standard prefix");
+  assert(line.endsWith("\n"), "ends with a newline");
+  assertEqual(line.trim().split("\n").length, 1, "single line");
+  const expectedBase = path.join(os.tmpdir(), "worktree");
+  assert(line.includes(expectedBase), "mentions the rejected path's base");
+  assert(line.includes(path.resolve(configDir)), "mentions the resolved config dir");
+});
+
+test("isExistingDir: true for an existing directory", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-37-isdir-"));
+  try {
+    assertEqual(isExistingDir(dir), true, "existing directory returns true");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isExistingDir: false for a non-existent path", () => {
+  const dir = path.join(os.tmpdir(), "mem-gk-37-does-not-exist-" + Date.now());
+  assertEqual(isExistingDir(dir), false, "non-existent path returns false");
+});
+
+test("isExistingDir: false for a file (not a directory)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mem-gk-37-isfile-"));
+  const filePath = path.join(dir, "not-a-dir.txt");
+  fs.writeFileSync(filePath, "content");
+  try {
+    assertEqual(isExistingDir(filePath), false, "a file path returns false");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// New tests — ticket #37 fix cycle: alias-tolerant scope comparison
+// ---------------------------------------------------------------------------
+//
+// Blocking finding (Codex correctness pass): resolveConfigDir() deterministically
+// prefers one spelling (e.g. ~/.claude) when both candidates exist, but
+// parseMemoryPath()'s scope check was a raw normalized-string comparison. If the
+// two candidate directories are ever ALIASES of the same directory on disk (a
+// junction, a symlinked/redirected profile), a write addressed via the
+// non-preferred spelling compared unequal to the resolved config dir and passed
+// through unintercepted — the same silent-pass-through failure class ticket #37
+// exists to eliminate, reached by a different route.
+
+console.log("\n--- New tests (ticket #37 fix): alias-tolerant parseMemoryPath scope comparison ---");
+
+/**
+ * Attempt to create a directory alias (junction on win32, symlink on POSIX)
+ * pointing at `targetDir`. Returns the alias path on success, or null if
+ * creation failed for an environmental reason (EPERM/EACCES on POSIX
+ * symlinks without privilege, etc.) — callers must print a SKIP and return
+ * without asserting anything in that case, never silently pass.
+ *
+ * @param {string} targetDir
+ * @returns {string|null}
+ */
+function tryCreateDirAlias(targetDir) {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const linkPath = path.join(tmpRoot, "mem-gk-37fix-alias-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  try {
+    if (os.platform() === "win32") {
+      // Directory junctions do not require elevation; plain "dir" symlinks do.
+      fs.symlinkSync(targetDir, linkPath, "junction");
+    } else {
+      fs.symlinkSync(targetDir, linkPath, "dir");
+    }
+    return linkPath;
+  } catch (err) {
+    console.log(`        SKIP — could not create a directory alias (${err.message}); environment lacks permission`);
+    return null;
+  }
+}
+
+/**
+ * Remove a directory alias created by tryCreateDirAlias without touching the
+ * target's contents. rmdirSync on a junction/symlink removes only the
+ * reparse point / link itself, never recurses into the target.
+ */
+function removeDirAlias(linkPath) {
+  try {
+    fs.rmdirSync(linkPath);
+  } catch {
+    // Best-effort cleanup.
+  }
+}
+
+test("Alias #37fix: memory path addressed via alias spelling, configDir via real spelling → in scope", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const realDir = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37fix-real-"));
+  const memoryDir = path.join(realDir, "projects", "my-slug", "memory");
+  fs.mkdirSync(memoryDir, { recursive: true });
+
+  const aliasDir = tryCreateDirAlias(realDir);
+  if (!aliasDir) {
+    fs.rmSync(realDir, { recursive: true, force: true });
+    return; // SKIP already printed by tryCreateDirAlias.
+  }
+  console.log("        (ran junction/symlink branch — alias created successfully)");
+
+  try {
+    // File addressed through the ALIAS spelling; configDir resolved to the REAL spelling.
+    const liveFileViaAlias = path.join(aliasDir, "projects", "my-slug", "memory", "NOTE.md");
+    const parsed = parseMemoryPath(liveFileViaAlias, realDir);
+    assert(parsed !== null, "alias-addressed path must resolve into scope when configDir is the real spelling");
+    assertEqual(parsed.slug, "my-slug", "slug parsed correctly via alias fallback");
+    assertEqual(parsed.rest, "NOTE.md", "rest parsed correctly via alias fallback");
+  } finally {
+    removeDirAlias(aliasDir);
+    fs.rmSync(realDir, { recursive: true, force: true });
+  }
+});
+
+test("Alias #37fix: memory path addressed via real spelling, configDir via alias spelling → in scope (vice versa)", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const realDir = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37fix-real2-"));
+  const memoryDir = path.join(realDir, "projects", "my-slug", "memory");
+  fs.mkdirSync(memoryDir, { recursive: true });
+
+  const aliasDir = tryCreateDirAlias(realDir);
+  if (!aliasDir) {
+    fs.rmSync(realDir, { recursive: true, force: true });
+    return; // SKIP already printed by tryCreateDirAlias.
+  }
+  console.log("        (ran junction/symlink branch — alias created successfully)");
+
+  try {
+    // File addressed through the REAL spelling; configDir resolved to the ALIAS spelling.
+    const liveFileReal = path.join(realDir, "projects", "my-slug", "memory", "NOTE.md");
+    const parsed = parseMemoryPath(liveFileReal, aliasDir);
+    assert(parsed !== null, "real-spelled path must resolve into scope when configDir is the alias spelling");
+    assertEqual(parsed.slug, "my-slug", "slug parsed correctly via alias fallback (vice versa)");
+    assertEqual(parsed.rest, "NOTE.md", "rest parsed correctly via alias fallback (vice versa)");
+  } finally {
+    removeDirAlias(aliasDir);
+    fs.rmSync(realDir, { recursive: true, force: true });
+  }
+});
+
+test("Alias #37fix (E2E): Write addressed via alias spelling with CLAUDE_CONFIG_DIR set to the real spelling emits deny and stages the gatekeeper file", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const realDir = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37fix-e2e-"));
+  const memoryDir = path.join(realDir, "projects", "my-slug", "memory");
+  fs.mkdirSync(memoryDir, { recursive: true });
+
+  const aliasDir = tryCreateDirAlias(realDir);
+  if (!aliasDir) {
+    fs.rmSync(realDir, { recursive: true, force: true });
+    return; // SKIP already printed by tryCreateDirAlias.
+  }
+  console.log("        (ran junction/symlink branch — alias created successfully)");
+
+  try {
+    const liveFileViaAlias = path.join(aliasDir, "projects", "my-slug", "memory", "NOTE.md");
+    const result = runHook(makeWriteEvent(liveFileViaAlias, "aliased content"), { CLAUDE_CONFIG_DIR: realDir });
+    assertEqual(result.status, 0, "exit 0");
+    const out = JSON.parse(result.stdout.trim());
+    assertEqual(out.hookSpecificOutput.permissionDecision, "deny",
+      "alias-addressed memory write must be denied, not silently pass through");
+
+    // The gatekeeper root is derived from the base actually used in the write
+    // (the alias spelling); the junction makes it the same on-disk location
+    // as the real spelling.
+    const gkPathViaAlias = path.join(aliasDir, "gatekeeper", "my-slug", "memory", "NOTE.md");
+    const gkPathViaReal = path.join(realDir, "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(fs.existsSync(gkPathViaAlias), "gatekeeper file staged (visible via alias spelling)");
+    assert(fs.existsSync(gkPathViaReal), "gatekeeper file staged (visible via real spelling — same on-disk file)");
+  } finally {
+    removeDirAlias(aliasDir);
+    fs.rmSync(realDir, { recursive: true, force: true });
+  }
+});
+
+test("Alias #37fix guard: non-existent base still returns null, no crash from the guarded realpath", () => {
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const nonExistentBase = path.join(tmpRoot, "mem-gk-37fix-guard-nonexistent-" + Date.now());
+  const filePath = path.join(nonExistentBase, "projects", "my-slug", "memory", "NOTE.md");
+  const configDir = fs.mkdtempSync(path.join(tmpRoot, "mem-gk-37fix-guard-cfg-"));
+  try {
+    let threw = false;
+    let result;
+    try {
+      result = parseMemoryPath(filePath, configDir);
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "parseMemoryPath must not crash when the base does not exist on disk");
+    assertEqual(result, null, "a non-existent base must not spuriously resolve into scope");
+  } finally {
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("Alias #37fix guard: a genuinely different directory (no aliasing) still returns null and still emits the stderr diagnostic", () => {
+  const worktreeBase = fs.realpathSync(os.tmpdir());
+  const worktreeDir = fs.mkdtempSync(path.join(worktreeBase, "mem-gk-37fix-guard-diff-"));
+  const memoryDir = path.join(worktreeDir, "projects", "my-slug", "memory");
+  const liveFile = path.join(memoryDir, "NOTE.md");
+  fs.mkdirSync(memoryDir, { recursive: true });
+  fs.writeFileSync(liveFile, "worktree content");
+
+  try {
+    // No CLAUDE_CONFIG_DIR override → resolves to the real ~/.claude, which is
+    // genuinely unrelated to worktreeDir (not an alias of it).
+    const result = runHook(makeWriteEvent(liveFile, "new content"), { CLAUDE_CONFIG_DIR: "" });
+    assertEqual(result.status, 0, "exit 0");
+    assertEqual(result.stdout.trim(), "", "no deny output — genuinely out-of-scope path still passes through");
+    const gkPath = path.join(worktreeDir, "gatekeeper", "my-slug", "memory", "NOTE.md");
+    assert(!fs.existsSync(gkPath), "no gatekeeper file created for a genuinely unrelated directory");
+    assert(result.stderr.includes("memory-gatekeeper-hook:"), "the alias fallback must not suppress the diagnostic");
+    const lines = result.stderr.trim().split("\n");
+    assertEqual(lines.length, 1, "still exactly one stderr line");
+  } finally {
+    fs.rmSync(worktreeDir, { recursive: true, force: true });
+  }
+});
+
+test("Alias #37fix guard: in-scope write still emits NO diagnostic (fast path unaffected)", () => {
+  const { base, liveFile } = makeTempBase("slug-37fix-inscope", "NOTE.md");
+  try {
+    const result = runHook(makeWriteEvent(liveFile, "in scope content"), { CLAUDE_CONFIG_DIR: base });
+    assertEqual(result.stderr.trim(), "", "no diagnostic for an in-scope write on the fast (exact-match) path");
+    const out = JSON.parse(result.stdout.trim());
+    assertEqual(out.hookSpecificOutput.permissionDecision, "deny", "deny still appears on stdout");
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
