@@ -108,6 +108,11 @@ jobs:
           # description.md ships onto the orphan release branch so the dispatch
           # payload's description_url resolves at the tagged commit.
           if [ -f description.md ]; then cp -a description.md "$STAGE/"; fi
+          # .gitattributes must exist on the orphan release branch: it is what
+          # clients check out, and its eol=lf overrides a Windows client's default
+          # core.autocrlf=true — without it the shipped SKILL.md / hooks.json /
+          # plugin manifests arrive as CRLF and Claude Code silently ignores them.
+          if [ -f .gitattributes ]; then cp -a .gitattributes "$STAGE/"; fi
           # obsidian-template/ carries the static vault config plus the
           # downloaded plugin build (main.js/manifest.json/styles.css).
           if [ -d obsidian-template ]; then cp -a obsidian-template "$STAGE/"; fi
@@ -165,7 +170,7 @@ jobs:
           rm -f obsidian-template/.obsidian/plugins/memory-gatekeeper/.gitignore
 
           echo "=== release branch contents ==="
-          find . -mindepth 1 -not -path './.git*' | sort
+          find . -mindepth 1 -not -path './.git' -not -path './.git/*' | sort
 
           git add -A
           git commit -m "release: v${{ inputs.version }}"
@@ -182,6 +187,15 @@ jobs:
             fi
           done
           echo "Verified: all three plugin artifacts are present in the release commit."
+
+          # .gitattributes pins eol=lf for clients checking out this branch;
+          # assert it explicitly rather than relying on the "release branch
+          # contents" listing above being read carefully.
+          if ! git cat-file -e "HEAD:.gitattributes" 2>/dev/null; then
+            echo "::error::.gitattributes missing from orphan release commit — client checkouts will get CRLF"
+            exit 1
+          fi
+          echo "Verified: .gitattributes is present in the release commit."
 
           SHA=$(git rev-parse HEAD)
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
