@@ -1,0 +1,303 @@
+/* ---- File explorer markers ---- */
+.nav-file-title.gatekeeper-new,
+.nav-file-title.gatekeeper-modified {
+  border-left: 4px solid transparent;
+  font-weight: var(--font-bold);
+  border-radius: var(--radius-s);
+}
+.nav-file-title.gatekeeper-new {
+  border-left-color: var(--color-green, #44cf6e);
+  background-color: rgba(68, 207, 110, 0.16);
+}
+.nav-file-title.gatekeeper-modified {
+  border-left-color: var(--color-orange, #e0a83b);
+  background-color: rgba(224, 168, 59, 0.18);
+}
+.nav-file-title.gatekeeper-new .nav-file-title-content::after,
+.nav-file-title.gatekeeper-modified .nav-file-title-content::after {
+  margin-left: 6px;
+  font-size: 0.85em;
+  font-weight: var(--font-bold);
+  vertical-align: middle;
+}
+.nav-file-title.gatekeeper-new .nav-file-title-content::after {
+  content: "● new";
+  color: var(--color-green, #44cf6e);
+}
+.nav-file-title.gatekeeper-modified .nav-file-title-content::after {
+  content: "● mod";
+  color: var(--color-orange, #e0a83b);
+}
+
+/* ---- Review panel ---- */
+.gatekeeper-review .gatekeeper-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+.gatekeeper-group-header {
+  margin: 0.8em 0 0.3em;
+  font-weight: var(--font-bold);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.gatekeeper-row {
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+  border-left: 3px solid transparent;
+  margin-bottom: 2px;
+}
+.gatekeeper-row.gatekeeper-new {
+  border-left-color: var(--color-green, #44cf6e);
+}
+.gatekeeper-row.gatekeeper-modified {
+  border-left-color: var(--color-orange, #e0a83b);
+}
+.gatekeeper-row-name {
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  word-break: break-all;
+}
+.gatekeeper-row-name:hover {
+  text-decoration: underline;
+}
+.gatekeeper-row-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.gatekeeper-row-buttons button {
+  font-size: var(--font-ui-smaller);
+  padding: 2px 8px;
+}
+
+/* ---- Modal button row (used by the compare view's dirty-resolve modal) ---- */
+.gatekeeper-diff-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  justify-content: flex-end;
+}
+
+/* ---- Compare view ---- */
+.gatekeeper-compare {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+.gatekeeper-compare-toolbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex-shrink: 0;
+}
+.gatekeeper-compare-filename {
+  flex: 1;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gatekeeper-compare-panes {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  overflow: hidden;
+}
+.gatekeeper-compare-editor {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+.gatekeeper-compare-editor .cm-mergeView {
+  height: 100%;
+}
+.gatekeeper-compare-editor .cm-mergeViewEditors {
+  height: 100%;
+}
+.gatekeeper-compare-editor .cm-mergeViewEditor {
+  flex: 1;
+  overflow: auto;
+}
+
+/* ---- Edit/MergeView highlighting (stronger, not color-only) ----
+   Red-green-safe: changed lines carry a thick left bar (solid = added side,
+   dashed = deleted side) and inline edits use underline / line-through so the
+   change is legible without relying on hue. */
+/* @codemirror/merge ships a baseTheme whose selectors are highly specific
+   (`.cm-editor.cm-merge-a .cm-changedLine`, plus `&dark…` variants), so plain
+   overrides lose. We use !important to win reliably across light/dark and both
+   editors. a = left (vault / new) -> green; b = right (target / old) and all
+   deletions -> red. Solid vs dashed left bar + underline/line-through keep it
+   legible without relying on hue (red-green color weakness). */
+
+/* Changed lines — new (a) side green, old (b) side red */
+.gatekeeper-compare-editor .cm-merge-a .cm-changedLine,
+.gatekeeper-compare-editor .cm-insertedLine {
+  background-color: rgba(64, 191, 128, 0.32) !important;
+  box-shadow: inset 4px 0 0 0 #2ea043;
+}
+.gatekeeper-compare-editor .cm-merge-b .cm-changedLine,
+.gatekeeper-compare-editor .cm-inlineChangedLine,
+.gatekeeper-compare-editor .cm-deletedChunk,
+.gatekeeper-compare-editor .cm-deletedLine {
+  background-color: rgba(224, 80, 80, 0.3) !important;
+  box-shadow: inset 4px 0 0 0 #d04545;
+}
+
+/* Changed/deleted words — no extra fill on top of the line background; just a
+   non-color cue (underline = changed, line-through = deleted) to pinpoint the
+   exact words without a second, distracting background layer. */
+.gatekeeper-compare-editor .cm-merge-a .cm-changedText,
+.gatekeeper-compare-editor .cm-merge-b .cm-changedText {
+  background-color: transparent !important;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+}
+.gatekeeper-compare-editor .cm-deletedChunk .cm-deletedText,
+.gatekeeper-compare-editor .cm-deletedText {
+  background-color: transparent !important;
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
+.gatekeeper-compare-editor .cm-changeGutter {
+  width: 12px;
+}
+
+/* ---- Compare/rendered mode ---- */
+.gatekeeper-compare-rendered {
+  flex: 1;
+  width: 100%;
+  overflow: auto;
+  padding: 12px 16px;
+  font-family: var(--font-text);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+}
+.gatekeeper-compare-legend {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  gap: 16px;
+  padding: 4px 8px;
+  margin-bottom: 12px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+.gatekeeper-legend-added {
+  font-weight: var(--font-bold);
+  border-left: 4px solid #2ea043;
+  padding-left: 6px;
+}
+.gatekeeper-legend-removed {
+  font-weight: var(--font-bold);
+  border-left: 4px dashed #d04545;
+  padding-left: 6px;
+}
+.gatekeeper-compare-identical {
+  padding: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.gatekeeper-seg-context {
+  padding: 2px 4px;
+  color: var(--text-normal);
+}
+/* Tighten Obsidian's default block margins inside compare segments so the
+   rendered prose stays compact. */
+.gatekeeper-compare-rendered .markdown-rendered > :first-child {
+  margin-top: 0;
+}
+.gatekeeper-compare-rendered .markdown-rendered > :last-child {
+  margin-bottom: 0;
+}
+
+.gatekeeper-change {
+  margin: 10px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  overflow: hidden;
+}
+.gatekeeper-change-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.gatekeeper-change-label {
+  font-weight: var(--font-bold);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-right: auto;
+}
+.gatekeeper-change-accept,
+.gatekeeper-change-revert {
+  font-size: var(--font-ui-smaller);
+  padding: 2px 10px;
+}
+.gatekeeper-change-cols {
+  display: flex;
+  flex-direction: row;
+}
+.gatekeeper-change-cell {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+}
+/* No extra column separator here: the removed cell's own dashed left bar (below)
+   already divides the columns. A `.cell + .cell { border-left }` rule would
+   out-specify and hide that dashed marker — the key non-color cue. */
+/* Added (vault/new): solid green left bar + light fill.
+   Removed (memory/old): dashed red left bar + light fill.
+   Solid-vs-dashed bar and the "+"/"−" labels carry the meaning without hue. */
+.gatekeeper-change-added {
+  background-color: rgba(64, 191, 128, 0.28);
+  border-left: 6px solid #2ea043;
+}
+.gatekeeper-change-removed {
+  background-color: rgba(224, 80, 80, 0.26);
+  border-left: 6px dashed #d04545;
+}
+.gatekeeper-change-cell-label {
+  display: inline-block;
+  font-weight: var(--font-bold);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 6px;
+  padding: 1px 6px;
+  border-radius: var(--radius-s);
+  color: var(--text-on-accent);
+}
+.gatekeeper-change-added .gatekeeper-change-cell-label {
+  background-color: #2ea043;
+}
+.gatekeeper-change-removed .gatekeeper-change-cell-label {
+  background-color: #d04545;
+}
+.gatekeeper-change-empty {
+  font-style: italic;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+/* ---- Settings ---- */
+.gatekeeper-settings-status {
+  margin: -6px 0 12px;
+  font-size: var(--font-ui-small);
+}
+.gatekeeper-status-active {
+  color: var(--color-green, #44cf6e);
+}
+.gatekeeper-status-inactive {
+  color: var(--text-muted);
+}
